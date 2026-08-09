@@ -1,0 +1,16 @@
+{
+  "type": "minecraft:crafting_shaped",
+  "pattern": [
+    " D ",
+    "DCD",
+    " D "
+  ],
+  "key": {
+    "D": { "item": "minecraft:diamond" },
+    "C": { "item": "minecraft:clock" }
+  },
+  "result": {
+    "item": "chronos:chronos_shard",
+    "count": 1
+  }
+}
