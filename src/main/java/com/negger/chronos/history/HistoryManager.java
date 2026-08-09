@@ -1,27 +1,46 @@
 package com.negger.chronos.history;
 
 import com.negger.chronos.ChronosConfig;
+import net.minecraft.entity.LivingEntity;
 import net.minecraft.server.network.ServerPlayerEntity;
-import net.minecraft.world.World;
 
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Deque;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArraySet;
 
 /**
- * Enregistre en continu :
- *  - un buffer de positions/vie/faim par joueur (un ArrayDeque par joueur)
- *  - un buffer global des blocs cassés/posés par des joueurs
+ * Enregistre en continu tout ce qui peut être rembobiné :
+ *  - la position/vie/faim de chaque joueur (par joueur)
+ *  - les blocs cassés/posés par chaque joueur, avec une pile "annulé" séparée
+ *    pour pouvoir les REJOUER si le joueur revient vers le présent
+ *  - la position/vie de toutes les entités vivantes du monde (animaux, mobs)
+ *  - les morts d'entités, pour pouvoir les ressusciter
  *
- * Les deux buffers sont bornés par ChronosConfig.getBufferTicks() pour éviter
- * une fuite mémoire si personne n'utilise jamais l'item de rewind.
+ * Tout est borné par ChronosConfig.getBufferTicks() pour éviter une fuite
+ * mémoire. Pendant qu'un joueur est en train de "voir le passé" (curseur de
+ * rewind actif), on NE réenregistre PAS sa position — sinon on écraserait
+ * l'historique avec des positions rembobinées, ce qui corrompait tout dans
+ * la version précédente du mod.
  */
 public class HistoryManager {
 
     private static final Map<UUID, Deque<TimeSnapshot>> PLAYER_HISTORY = new ConcurrentHashMap<>();
-    private static final Deque<BlockChange> BLOCK_HISTORY = new ArrayDeque<>();
+    private static final Set<UUID> PAUSED_PLAYERS = new CopyOnWriteArraySet<>();
+
+    // Historique des blocs PAR joueur : plus simple et évite les conflits entre joueurs
+    private static final Map<UUID, Deque<BlockChange>> BLOCK_HISTORY = new ConcurrentHashMap<>();
+    // Piles des changements déjà annulés par ce joueur, prêtes à être rejouées
+    // s'il revient vers le présent (clic gauche)
+    private static final Map<UUID, Deque<BlockChange>> BLOCK_UNDO_STACK = new ConcurrentHashMap<>();
+
+    private static final Deque<EntitySnapshot> ENTITY_HISTORY = new ArrayDeque<>();
+    private static final Deque<DeathRecord> DEATH_RECORDS = new ArrayDeque<>();
 
     private static long currentTick = 0;
 
@@ -33,9 +52,22 @@ public class HistoryManager {
         return currentTick;
     }
 
+    // ----- Pause de l'enregistrement pendant un rewind actif -----
+
+    public static void setPaused(UUID playerUuid, boolean paused) {
+        if (paused) PAUSED_PLAYERS.add(playerUuid);
+        else PAUSED_PLAYERS.remove(playerUuid);
+    }
+
+    public static boolean isPaused(UUID playerUuid) {
+        return PAUSED_PLAYERS.contains(playerUuid);
+    }
+
     // ----- Historique joueur -----
 
     public static void recordSnapshot(ServerPlayerEntity player) {
+        if (isPaused(player.getUuid())) return;
+
         Deque<TimeSnapshot> history = PLAYER_HISTORY.computeIfAbsent(player.getUuid(), id -> new ArrayDeque<>());
 
         history.addLast(new TimeSnapshot(
@@ -53,28 +85,11 @@ public class HistoryManager {
         }
     }
 
-    /** Retire et renvoie le snapshot le plus récent d'un joueur, ou null si l'historique est vide. */
-    public static TimeSnapshot popLatestSnapshot(UUID playerUuid) {
+    /** Copie l'historique complet d'un joueur (du plus vieux au plus récent), sans le vider. */
+    public static List<TimeSnapshot> snapshotHistory(UUID playerUuid) {
         Deque<TimeSnapshot> history = PLAYER_HISTORY.get(playerUuid);
-        if (history == null || history.isEmpty()) return null;
-        return history.pollLast();
-    }
-
-    /**
-     * Saut direct : dépile jusqu'à "ticksBack" snapshots d'un coup et renvoie
-     * uniquement le dernier (le point d'arrivée), sans téléporter à chaque étape.
-     * Utilisé par la commande /chronos back pour un saut instantané précis.
-     * Renvoie null si l'historique est vide dès le départ.
-     */
-    public static TimeSnapshot jumpBack(UUID playerUuid, int ticksBack) {
-        Deque<TimeSnapshot> history = PLAYER_HISTORY.get(playerUuid);
-        if (history == null || history.isEmpty()) return null;
-
-        TimeSnapshot last = null;
-        for (int i = 0; i < ticksBack && !history.isEmpty(); i++) {
-            last = history.pollLast();
-        }
-        return last;
+        if (history == null) return new ArrayList<>();
+        return new ArrayList<>(history);
     }
 
     public static int getPlayerHistorySize(UUID playerUuid) {
@@ -82,58 +97,121 @@ public class HistoryManager {
         return history == null ? 0 : history.size();
     }
 
+    /**
+     * Remplace la fin de l'historique d'un joueur par le contenu fourni.
+     * Utilisé quand une session de rewind se termine : tout ce qui a été
+     * "visité" en arrière est retiré du vrai historique (comme une branche
+     * temporelle qui disparaît), sauf si le joueur est revenu pile au présent.
+     */
+    public static void truncateHistoryTo(UUID playerUuid, int keepFromStart) {
+        Deque<TimeSnapshot> history = PLAYER_HISTORY.get(playerUuid);
+        if (history == null) return;
+        List<TimeSnapshot> asList = new ArrayList<>(history);
+        history.clear();
+        for (int i = 0; i < Math.min(keepFromStart, asList.size()); i++) {
+            history.addLast(asList.get(i));
+        }
+    }
+
     public static void clearPlayerHistory(UUID playerUuid) {
         PLAYER_HISTORY.remove(playerUuid);
+        BLOCK_HISTORY.remove(playerUuid);
+        BLOCK_UNDO_STACK.remove(playerUuid);
+        PAUSED_PLAYERS.remove(playerUuid);
     }
 
-    // ----- Historique des blocs -----
+    // ----- Historique des blocs (par joueur) -----
 
     public static void recordBlockChange(BlockChange change) {
-        synchronized (BLOCK_HISTORY) {
-            BLOCK_HISTORY.addLast(change);
+        Deque<BlockChange> history = BLOCK_HISTORY.computeIfAbsent(change.playerUuid(), id -> new ArrayDeque<>());
+        synchronized (history) {
+            history.addLast(change);
             int maxSize = ChronosConfig.getBufferTicks();
-            while (BLOCK_HISTORY.size() > maxSize) {
-                BLOCK_HISTORY.pollFirst();
+            while (history.size() > maxSize) {
+                history.pollFirst();
             }
         }
+        // Une nouvelle action "efface" ce qui aurait pu être rejoué (comme une vraie branche temporelle)
+        Deque<BlockChange> undo = BLOCK_UNDO_STACK.get(change.playerUuid());
+        if (undo != null) undo.clear();
     }
 
-    /**
-     * Retire et renvoie le dernier changement de bloc fait par ce joueur
-     * dont le tick est >= minTick, ou null s'il n'y en a pas.
-     * Utilisé pour restaurer les blocs pendant le rewind, en synchro avec
-     * la position du joueur qu'on est en train de rembobiner.
-     */
-    public static BlockChange popMatchingBlockChange(UUID playerUuid, long minTick, boolean restrictToPlayer) {
-        synchronized (BLOCK_HISTORY) {
-            BlockChange last = BLOCK_HISTORY.peekLast();
+    /** Retire et renvoie le dernier changement de CE joueur dont le tick est >= minTick, ou null. */
+    public static BlockChange popMatchingBlockChange(UUID playerUuid, long minTick) {
+        Deque<BlockChange> history = BLOCK_HISTORY.get(playerUuid);
+        if (history == null) return null;
+        synchronized (history) {
+            BlockChange last = history.peekLast();
             if (last == null || last.tick() < minTick) return null;
-            if (restrictToPlayer && !last.playerUuid().equals(playerUuid)) return null;
-            return BLOCK_HISTORY.pollLast();
+            history.pollLast();
+            BLOCK_UNDO_STACK.computeIfAbsent(playerUuid, id -> new ArrayDeque<>()).addLast(last);
+            return last;
         }
     }
 
-    /**
-     * Dépile et renvoie TOUS les changements de blocs dont le tick >= minTick,
-     * dans l'ordre du plus récent au plus ancien (donc prêt à être réappliqué
-     * tel quel pour un revert en masse). Utilisé par /chronos back pour un
-     * saut instantané qui remet tous les blocs cassés/posés dans la fenêtre.
-     */
-    public static java.util.List<BlockChange> popAllBlockChangesSince(UUID playerUuid, long minTick, boolean restrictToPlayer) {
-        java.util.List<BlockChange> result = new java.util.ArrayList<>();
-        synchronized (BLOCK_HISTORY) {
-            while (true) {
-                BlockChange last = BLOCK_HISTORY.peekLast();
-                if (last == null || last.tick() < minTick) break;
-                if (restrictToPlayer && !last.playerUuid().equals(playerUuid)) {
-                    // Un changement d'un autre joueur bloque la pile : on l'ignore mais
-                    // on ne peut pas "sauter" au-dessus proprement avec un Deque simple,
-                    // donc on le laisse en place et on s'arrête pour cette itération.
-                    break;
-                }
-                result.add(BLOCK_HISTORY.pollLast());
+    /** Rejoue (redo) le dernier changement annulé de ce joueur, si son tick est <= maxTick. */
+    public static BlockChange redoMatchingBlockChange(UUID playerUuid, long maxTick) {
+        Deque<BlockChange> undo = BLOCK_UNDO_STACK.get(playerUuid);
+        if (undo == null) return null;
+        synchronized (undo) {
+            BlockChange last = undo.peekLast();
+            if (last == null || last.tick() > maxTick) return null;
+            undo.pollLast();
+            BLOCK_HISTORY.computeIfAbsent(playerUuid, id -> new ArrayDeque<>()).addLast(last);
+            return last;
+        }
+    }
+
+    // ----- Historique des entités (animaux/mobs, global) -----
+
+    public static void recordEntitySnapshot(LivingEntity entity) {
+        synchronized (ENTITY_HISTORY) {
+            ENTITY_HISTORY.addLast(new EntitySnapshot(
+                    currentTick, entity.getUuid(),
+                    entity.getX(), entity.getY(), entity.getZ(),
+                    entity.getYaw(), entity.getPitch(),
+                    entity.getHealth()
+            ));
+            int maxSize = ChronosConfig.getBufferTicks() * 8; // plusieurs entités par tick
+            while (ENTITY_HISTORY.size() > maxSize) {
+                ENTITY_HISTORY.pollFirst();
             }
         }
-        return result;
+    }
+
+    /** Renvoie le dernier snapshot connu de chaque entité dont le tick est >= minTick (pour un pas de rewind). */
+    public static List<EntitySnapshot> getEntitySnapshotsSince(long minTick) {
+        synchronized (ENTITY_HISTORY) {
+            List<EntitySnapshot> result = new ArrayList<>();
+            for (EntitySnapshot s : ENTITY_HISTORY) {
+                if (s.tick() >= minTick) result.add(s);
+            }
+            return result;
+        }
+    }
+
+    public static void recordDeath(DeathRecord record) {
+        synchronized (DEATH_RECORDS) {
+            DEATH_RECORDS.addLast(record);
+            int maxSize = 2000;
+            while (DEATH_RECORDS.size() > maxSize) {
+                DEATH_RECORDS.pollFirst();
+            }
+        }
+    }
+
+    /** Renvoie et retire les morts survenues entre minTick et maxTick (pour les ressusciter en rembobinant). */
+    public static List<DeathRecord> popDeathsBetween(long minTick, long maxTick) {
+        synchronized (DEATH_RECORDS) {
+            List<DeathRecord> result = new ArrayList<>();
+            DEATH_RECORDS.removeIf(d -> {
+                if (d.tick() >= minTick && d.tick() <= maxTick) {
+                    result.add(d);
+                    return true;
+                }
+                return false;
+            });
+            return result;
+        }
     }
 }

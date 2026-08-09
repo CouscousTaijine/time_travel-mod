@@ -7,34 +7,33 @@ craftable : l'**Éclat Chronos**.
 ## Comment ça marche
 
 - Chaque tick (20x/sec), le mod prend un "instantané" de chaque joueur connecté
-  (position, rotation, vie, faim) et le stocke dans un buffer par joueur.
-- Chaque cassage/pose de bloc par un joueur est aussi enregistré avec l'état
-  du bloc avant le changement.
-- Ces buffers sont bornés dans le temps (voir config ci-dessous), pour ne pas
-  faire fuir la RAM du serveur.
-- **Clic droit maintenu** avec l'Éclat Chronos en main = rewind. Tant que tu
-  maintiens, le mod dépile ton historique tick par tick : tu es téléporté en
-  arrière, ta vie/faim est restaurée, et les blocs que tu as toi-même
-  cassés/posés dans cette fenêtre sont remis à leur état d'origine.
-- Relâche le clic = tu t'arrêtes là. Le jeu recommence à enregistrer
-  normalement à partir de ce nouveau point dans le temps (comme une vraie
-  branche temporelle — ce qui a été "rembobiné" est définitivement effacé).
+  (position, rotation, vie, faim), de chaque animal/monstre du monde, et
+  enregistre les blocs cassés/posés par les joueurs.
+- Dès que tu commences à rembobiner, l'enregistrement de TA position se met en
+  pause (sinon il s'écraserait avec les positions du rewind) — mais le monde,
+  lui, continue de tourner normalement pendant ce temps.
 
-## Saut temporel précis (commande)
+### Contrôles de l'Éclat Chronos
 
-En plus de l'item (rewind visuel en temps réel), tu peux sauter direct à un
-moment précis avec une commande (nécessite d'être op, niveau 2 par défaut) :
+| Action | Effet |
+|---|---|
+| Clic droit **maintenu** | Rembobine en arrière, en direct (timelapse) |
+| Clic gauche | Repart en avant jusqu'au présent, en direct (timelapse) |
+| Accroupi + clic droit | Pose un point de sauvegarde à l'instant présent |
+| Accroupi + clic gauche | Revient à ce point de sauvegarde (timelapse, pas instantané) |
+
+En reculant : les blocs que tu as cassés réapparaissent (et l'item correspondant
+est retiré de ton inventaire), les blocs que tu as posés disparaissent (et
+l'item te revient), les animaux/monstres tués dans cette fenêtre ressuscitent
+à leur position d'origine. En avançant (retour au présent), tout est rejoué
+dans l'autre sens pour les blocs.
+
+### Commande de secours
 
 ```
-/chronos back 20      -> saute 20 minutes en arrière, instantanément
-/chronos back 0.5      -> saute 30 secondes en arrière
-/chronos status         -> combien de temps d'historique il te reste
+/chronos back 20    -> saute 20 minutes en arrière, instantanément (pas en timelapse)
+/chronos status      -> combien de temps d'historique il te reste
 ```
-
-Ça restaure aussi tous les blocs que tu as toi-même cassés/posés dans la
-fenêtre traversée. Item et commande partagent le même historique : si tu
-fais `/chronos back 5` puis que tu ressors l'Éclat Chronos, il continue
-depuis là où la commande t'a laissé (pas de doublon, pas de reset).
 
 ## Craft
 
@@ -73,17 +72,17 @@ l'item.
 
 ## Limites connues (honnêtes, pas cachées)
 
-- Le rewind de blocs ne capture que les cassages/poses **directs** d'un
-  joueur (clic gauche/droit). Les effets en chaîne (eau qui coule, pistons,
-  redstone, TNT) ne sont pas annulés automatiquement — seulement noter que
-  ce n'est pas dans le scope initial, ce serait un mixin séparé si tu veux
-  aller plus loin.
-- En multijoueur, si deux joueurs remontent le temps en même temps sur la
-  même zone, il peut y avoir des conflits d'ordre — `only_revert_own_blocks`
-  limite déjà pas mal ce risque en pratique solo/petit groupe.
-- Le rewind consomme définitivement l'historique traversé (pas de "avance
-  rapide" après coup). Si tu veux un mode "annuler le rewind", c'est
-  ajoutable mais pas fait ici.
+- Les blocs affectés en chaîne (eau qui coule, pistons, redstone, TNT) ne sont
+  pas suivis — seulement les cassages/poses directs d'un joueur.
+- La résurrection des animaux/monstres est du "best effort" : ça recrée une
+  nouvelle entité à partir du NBT sauvegardé (nom, apparence, état identiques)
+  mais ce n'est techniquement pas l'entité d'origine — elle aura un nouvel ID interne.
+- En multijoueur, si deux joueurs rembobinent en même temps très près l'un de
+  l'autre, il peut y avoir des interférences sur les entités partagées (les
+  blocs, eux, sont gérés par joueur donc sans conflit entre vous).
+- Le clic gauche est intercepté via un petit mixin (`HandSwingMixin`) parce que
+  Minecraft n'a pas d'event tout fait pour "clic gauche avec un item en main
+  sans rien viser".
 
 ## Compiler SANS rien installer (méthode simple)
 

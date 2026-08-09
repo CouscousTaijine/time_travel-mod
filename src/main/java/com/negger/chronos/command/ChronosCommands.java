@@ -4,9 +4,9 @@ import com.mojang.brigadier.CommandDispatcher;
 import com.mojang.brigadier.arguments.FloatArgumentType;
 import com.mojang.brigadier.exceptions.CommandSyntaxException;
 import com.negger.chronos.ChronosConfig;
-import com.negger.chronos.history.BlockChange;
 import com.negger.chronos.history.HistoryManager;
 import com.negger.chronos.history.TimeSnapshot;
+import com.negger.chronos.rewind.RewindManager;
 import net.minecraft.server.command.CommandManager;
 import net.minecraft.server.command.ServerCommandSource;
 import net.minecraft.server.network.ServerPlayerEntity;
@@ -15,14 +15,10 @@ import net.minecraft.text.Text;
 import java.util.List;
 
 /**
- * /chronos back <minutes>  -> saut instantané précis dans le passé
+ * /chronos back <minutes>  -> saut instantané précis dans le passé (pas en timelapse,
+ *                              contrairement à l'item — c'est fait exprès, pour un usage
+ *                              rapide en admin/debug)
  * /chronos status          -> combien de temps d'historique il te reste
- *
- * Contrairement à l'item (qui rembobine en temps réel, tick par tick, pour
- * VOIR le rewind se dérouler), cette commande saute directement au point
- * demandé en un seul coup. Les deux partagent le même historique : si tu
- * fais /chronos back 5 puis que tu utilises l'Éclat Chronos, il continuera
- * depuis là où la commande t'a laissé.
  */
 public class ChronosCommands {
 
@@ -38,31 +34,23 @@ public class ChronosCommands {
 
     private static int executeBack(com.mojang.brigadier.context.CommandContext<ServerCommandSource> ctx) throws CommandSyntaxException {
         ServerCommandSource source = ctx.getSource();
-        ServerPlayerEntity player = source.getPlayer(); // lève CommandSyntaxException si pas un joueur (ex: console)
+        ServerPlayerEntity player = source.getPlayer();
 
         float minutes = FloatArgumentType.getFloat(ctx, "minutes");
         int ticksRequested = Math.round(minutes * 60 * 20);
 
-        int availableTicks = HistoryManager.getPlayerHistorySize(player.getUuid());
-        if (availableTicks == 0) {
+        List<TimeSnapshot> history = HistoryManager.snapshotHistory(player.getUuid());
+        if (history.isEmpty()) {
             player.sendMessage(Text.literal("§cAucun historique disponible pour l'instant. Bouge un peu d'abord."), false);
             return 0;
         }
 
-        int actualTicks = Math.min(ticksRequested, availableTicks);
+        int targetIndex = Math.max(0, history.size() - ticksRequested);
+        TimeSnapshot target = history.get(targetIndex);
+        int actualTicks = history.size() - targetIndex;
 
-        TimeSnapshot target = HistoryManager.jumpBack(player.getUuid(), actualTicks);
-        if (target == null) {
-            player.sendMessage(Text.literal("§cÉchec du saut temporel."), false);
-            return 0;
-        }
-
-        // Restaure tous les blocs changés par ce joueur dans la fenêtre traversée
-        List<BlockChange> reverted = HistoryManager.popAllBlockChangesSince(
-                player.getUuid(), target.tick(), ChronosConfig.onlyRevertOwnBlocks);
-        for (BlockChange change : reverted) {
-            player.getServerWorld().setBlockState(change.pos(), change.oldState());
-        }
+        int reverted = RewindManager.revertInstantTo(player, target.tick());
+        HistoryManager.truncateHistoryTo(player.getUuid(), targetIndex + 1);
 
         player.teleport(player.getServerWorld(), target.x(), target.y(), target.z(), target.yaw(), target.pitch());
         if (ChronosConfig.restoreHealthAndHunger) {
@@ -75,11 +63,11 @@ public class ChronosCommands {
         if (actualTicks < ticksRequested) {
             player.sendMessage(Text.literal(String.format(
                     "§6Ton historique ne remontait pas si loin. Saut de %.1f min au lieu de %.1f min demandées (%d blocs restaurés).",
-                    actualMinutes, (double) minutes, reverted.size())), false);
+                    actualMinutes, (double) minutes, reverted)), false);
         } else {
             player.sendMessage(Text.literal(String.format(
                     "§bSaut de %.1f min dans le passé effectué (%d blocs restaurés).",
-                    actualMinutes, reverted.size())), false);
+                    actualMinutes, reverted)), false);
         }
 
         return 1;

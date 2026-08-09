@@ -42,7 +42,8 @@ public class PlacementTracker {
             BlockState after = check.world.getBlockState(check.pos);
             if (!after.equals(check.oldState)) {
                 HistoryManager.recordBlockChange(new BlockChange(
-                        now, check.pos.toImmutable(), check.oldState, after, check.playerUuid
+                        now, check.pos.toImmutable(), check.oldState, after, check.playerUuid,
+                        BlockChange.ChangeType.PLACE
                 ));
             }
         }
