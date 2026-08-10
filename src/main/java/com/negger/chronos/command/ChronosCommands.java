@@ -39,7 +39,7 @@ public class ChronosCommands {
         float minutes = FloatArgumentType.getFloat(ctx, "minutes");
         int ticksRequested = Math.round(minutes * 60 * 20);
 
-        List<TimeSnapshot> history = HistoryManager.snapshotHistory(player.getUuid());
+        List<TimeSnapshot> history = HistoryManager.combinedHistory(player.getUuid());
         if (history.isEmpty()) {
             player.sendMessage(Text.literal("§cAucun historique disponible pour l'instant. Bouge un peu d'abord."), false);
             return 0;
@@ -50,7 +50,16 @@ public class ChronosCommands {
         int actualTicks = history.size() - targetIndex;
 
         int reverted = RewindManager.revertInstantTo(player, target.tick());
-        HistoryManager.truncateHistoryTo(player.getUuid(), targetIndex + 1);
+
+        // La troncature du "futur" ne s'applique qu'à la partie récente en mémoire (20x/sec) ;
+        // si le saut va plus loin, dans la partie longue durée, on vide juste la partie récente.
+        List<TimeSnapshot> shortTerm = HistoryManager.snapshotHistory(player.getUuid());
+        int longTermCount = history.size() - shortTerm.size();
+        if (targetIndex < longTermCount) {
+            HistoryManager.truncateHistoryTo(player.getUuid(), 0);
+        } else {
+            HistoryManager.truncateHistoryTo(player.getUuid(), (targetIndex - longTermCount) + 1);
+        }
 
         player.teleport(player.getServerWorld(), target.x(), target.y(), target.z(), target.yaw(), target.pitch());
         if (ChronosConfig.restoreHealthAndHunger) {
@@ -77,14 +86,26 @@ public class ChronosCommands {
         ServerCommandSource source = ctx.getSource();
         ServerPlayerEntity player = source.getPlayer();
 
-        int ticks = HistoryManager.getPlayerHistorySize(player.getUuid());
-        double seconds = ticks / 20.0;
-        int minutes = (int) (seconds / 60);
-        double remSeconds = seconds - (minutes * 60);
+        int fluidTicks = HistoryManager.getPlayerHistorySize(player.getUuid());
+        int longTermPoints = HistoryManager.getLongTermHistory(player.getUuid()).size();
+
+        double fluidSeconds = fluidTicks / 20.0;
+        double totalSeconds = fluidSeconds + longTermPoints; // longTerm = 1 point/seconde
 
         player.sendMessage(Text.literal(String.format(
-                "§7Historique disponible : §b%d min %.0f s §7(capacité max configurée : %d s)",
-                minutes, remSeconds, ChronosConfig.bufferSeconds)), false);
+                "§7Historique fluide (20x/sec) : §b%.0f s §7| longue durée (1x/sec, survit aux redémarrages) : §b%s",
+                fluidSeconds, formatDuration(longTermPoints))), false);
+        player.sendMessage(Text.literal(String.format(
+                "§7Total remontable : §b%s", formatDuration((long) totalSeconds))), false);
         return 1;
+    }
+
+    private static String formatDuration(long totalSeconds) {
+        long days = totalSeconds / 86400;
+        long hours = (totalSeconds % 86400) / 3600;
+        long minutes = (totalSeconds % 3600) / 60;
+        if (days > 0) return String.format("%dj %dh %dmin", days, hours, minutes);
+        if (hours > 0) return String.format("%dh %dmin", hours, minutes);
+        return String.format("%dmin", minutes);
     }
 }

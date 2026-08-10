@@ -56,14 +56,13 @@ D C D
 ```
 D = Diamant, C = Horloge (clock vanilla)
 
-## Config — remonter "autant que tu veux"
+## Config
 
 Fichier généré au premier lancement : `config/chronos.properties`
 
 ```properties
-# Durée max de l'historique en secondes (5 min par défaut).
-# Augmente cette valeur pour pouvoir remonter plus loin.
-# Attention : plus c'est grand, plus ça consomme de RAM.
+# Fenêtre d'historique FLUIDE (20x/sec), gardée en RAM. Quelques minutes
+# suffisent, c'est elle qui donne un rewind bien lisse dans la période récente.
 buffer_seconds=300
 
 # Vitesse de rewind : 1.0 = temps réel, 2.0 = 2x plus vite en arrière
@@ -72,15 +71,34 @@ rewind_speed=1.0
 # Restaure la vie et la faim en plus de la position
 restore_health_and_hunger=true
 
-# Si true, ne restaure QUE les blocs que TOI tu as changés (évite les
-# conflits si plusieurs joueurs rewind en même temps sur le même serveur)
-only_revert_own_blocks=true
+# Sauvegarde l'historique sur le disque (survit aux redémarrages du serveur)
+persistence_enabled=true
+
+# Nombre de jours d'historique gardés sur le disque, à 1 point/seconde.
+# ~2-4 Mo par jour par joueur compressé. persist_days=30 reste raisonnable
+# (~100 Mo/joueur). C'est ÇA qui te permet de remonter des jours en arrière.
+persist_days=3
 ```
 
-Mets `buffer_seconds` à `3600` pour avoir 1h d'historique, `86400` pour 24h
-si ton serveur a de la RAM à revendre — c'est littéralement "autant que tu
-veux", juste borné pour éviter une fuite mémoire si personne n'utilise jamais
-l'item.
+### Remonter des jours en arrière : c'est possible, voici comment
+
+Oui, tu peux quitter la partie et revenir des jours après en arrière. Concrètement :
+- Les **5 dernières minutes** de jeu sont gardées en pleine fluidité (20 positions/sec)
+  en mémoire, pour un rewind bien lisse dans le passé récent.
+- **Au-delà**, un point de position est sauvegardé sur le disque **une fois par
+  seconde**, dans `<ton monde>/chronos/<uuid-du-joueur>.dat`, compressé comme
+  n'importe quelle sauvegarde Minecraft. C'est ça qui permet de remonter loin
+  sans exploser le disque : ~2-4 Mo/jour/joueur, donc même un mois d'historique
+  reste sous les 150 Mo par joueur — rien à voir avec des gigas.
+- Quand tu rembobines au-delà de la fenêtre récente, le timelapse devient un
+  peu moins fluide (1 saut par seconde au lieu de 20), mais ça reste un
+  timelapse progressif, pas un téléport instantané.
+- **Limite honnête** : seule TA position/vie/faim est gardée à ce niveau de
+  persistance. Les blocs cassés/posés et les animaux tués ne sont annulables
+  qu'au sein de la même session de jeu (pas après un redémarrage du serveur)
+  — sinon il aurait fallu tout re-sauvegarder en continu, ce qui aurait
+  vraiment fait grossir les fichiers. Si tu veux ça aussi plus tard, c'est
+  faisable, dis-le-moi.
 
 ## Limites connues (honnêtes, pas cachées)
 
@@ -90,8 +108,10 @@ l'item.
   nouvelle entité à partir du NBT sauvegardé (nom, apparence, état identiques)
   mais ce n'est techniquement pas l'entité d'origine — elle aura un nouvel ID interne.
 - Le repositionnement des animaux/monstres encore vivants ne se fait que sur
-  ceux qui étaient à moins de 96 blocs d'un joueur au moment de l'enregistrement
-  (pour ne pas surcharger le serveur en calculant pour toute la carte).
+  ceux qui étaient à moins de 96 blocs d'un joueur au moment de l'enregistrement.
+- Les blocs/animaux ne sont annulables/ressuscitables que dans la session de
+  jeu en cours (voir ci-dessus) — seule la position/vie/faim survit à un
+  redémarrage du serveur.
 - En multijoueur, si deux joueurs rembobinent en même temps très près l'un de
   l'autre, il peut y avoir des interférences sur les entités partagées (les
   blocs, eux, sont gérés par joueur donc sans conflit entre vous).

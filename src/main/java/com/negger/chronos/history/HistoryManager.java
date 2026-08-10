@@ -31,6 +31,7 @@ import java.util.concurrent.CopyOnWriteArraySet;
 public class HistoryManager {
 
     private static final Map<UUID, Deque<TimeSnapshot>> PLAYER_HISTORY = new ConcurrentHashMap<>();
+    private static final Map<UUID, Deque<TimeSnapshot>> LONG_TERM_HISTORY = new ConcurrentHashMap<>();
     private static final Set<UUID> PAUSED_PLAYERS = new CopyOnWriteArraySet<>();
 
     // Historique des blocs PAR joueur : plus simple et évite les conflits entre joueurs
@@ -50,6 +51,18 @@ public class HistoryManager {
 
     public static long getCurrentTick() {
         return currentTick;
+    }
+
+    /**
+     * À appeler UNE FOIS au démarrage du serveur, avant le premier tick, si
+     * une ancre d'horloge a été trouvée sur le disque. Fait "rattraper" le
+     * compteur de tick pour qu'il reste cohérent avec l'historique sauvegardé,
+     * en tenant compte du temps réel écoulé pendant que le serveur était éteint.
+     */
+    public static void initializeClockFromAnchor(long anchorTick, long anchorEpochMillis) {
+        long elapsedMillis = System.currentTimeMillis() - anchorEpochMillis;
+        long elapsedTicks = Math.max(0, Math.round(elapsedMillis / 50.0)); // 50ms/tick = 20 ticks/sec
+        currentTick = anchorTick + elapsedTicks;
     }
 
     // ----- Pause de l'enregistrement pendant un rewind actif -----
@@ -92,6 +105,60 @@ public class HistoryManager {
         return new ArrayList<>(history);
     }
 
+    // ----- Historique longue durée (1 point/seconde, persiste sur le disque) -----
+
+    public static void recordLongTermIfDue(ServerPlayerEntity player) {
+        if (!ChronosConfig.persistenceEnabled) return;
+        if (isPaused(player.getUuid())) return;
+        if (currentTick % 20 != 0) return; // une fois par seconde
+
+        Deque<TimeSnapshot> history = LONG_TERM_HISTORY.computeIfAbsent(player.getUuid(), id -> new ArrayDeque<>());
+        history.addLast(new TimeSnapshot(
+                currentTick,
+                player.getX(), player.getY(), player.getZ(),
+                player.getYaw(), player.getPitch(),
+                player.getHealth(),
+                player.getHungerManager().getFoodLevel(),
+                player.getHungerManager().getSaturationLevel()
+        ));
+
+        long maxSize = ChronosConfig.getPersistCapacity();
+        while (history.size() > maxSize) {
+            history.pollFirst();
+        }
+    }
+
+    public static List<TimeSnapshot> getLongTermHistory(UUID playerUuid) {
+        Deque<TimeSnapshot> history = LONG_TERM_HISTORY.get(playerUuid);
+        return history == null ? new ArrayList<>() : new ArrayList<>(history);
+    }
+
+    public static void setLongTermHistory(UUID playerUuid, List<TimeSnapshot> loaded) {
+        LONG_TERM_HISTORY.put(playerUuid, new ArrayDeque<>(loaded));
+    }
+
+    /**
+     * Historique combiné utilisé pour le rewind : les dernières minutes en
+     * fluide (20x/sec), tout ce qui est plus vieux en 1x/sec (chargé depuis
+     * le disque si le joueur vient de se reconnecter). C'est ce qui permet
+     * de remonter des jours en arrière, avec juste un timelapse un peu moins
+     * fluide une fois passé la fenêtre récente.
+     */
+    public static List<TimeSnapshot> combinedHistory(UUID playerUuid) {
+        List<TimeSnapshot> shortTerm = snapshotHistory(playerUuid);
+        List<TimeSnapshot> longTerm = getLongTermHistory(playerUuid);
+
+        if (shortTerm.isEmpty()) return longTerm;
+
+        long cutoff = shortTerm.get(0).tick();
+        List<TimeSnapshot> combined = new ArrayList<>();
+        for (TimeSnapshot s : longTerm) {
+            if (s.tick() < cutoff) combined.add(s);
+        }
+        combined.addAll(shortTerm);
+        return combined;
+    }
+
     public static int getPlayerHistorySize(UUID playerUuid) {
         Deque<TimeSnapshot> history = PLAYER_HISTORY.get(playerUuid);
         return history == null ? 0 : history.size();
@@ -118,6 +185,11 @@ public class HistoryManager {
         BLOCK_HISTORY.remove(playerUuid);
         BLOCK_UNDO_STACK.remove(playerUuid);
         PAUSED_PLAYERS.remove(playerUuid);
+    }
+
+    /** À appeler après avoir sauvegardé l'historique longue durée sur le disque, pour libérer la RAM. */
+    public static void unloadLongTermFromMemory(UUID playerUuid) {
+        LONG_TERM_HISTORY.remove(playerUuid);
     }
 
     // ----- Historique des blocs (par joueur) -----

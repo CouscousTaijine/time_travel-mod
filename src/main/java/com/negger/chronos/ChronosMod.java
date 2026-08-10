@@ -4,6 +4,7 @@ import com.negger.chronos.command.ChronosCommands;
 import com.negger.chronos.history.BlockChange;
 import com.negger.chronos.history.DeathRecord;
 import com.negger.chronos.history.HistoryManager;
+import com.negger.chronos.history.PersistenceIO;
 import com.negger.chronos.item.ChronosShardItem;
 import com.negger.chronos.listener.PlacementTracker;
 import com.negger.chronos.rewind.RewindManager;
@@ -24,11 +25,15 @@ import net.minecraft.item.ItemGroups;
 import net.minecraft.nbt.NbtCompound;
 import net.minecraft.registry.Registries;
 import net.minecraft.registry.Registry;
-import net.minecraft.server.world.ServerWorld;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.util.ActionResult;
 import net.minecraft.util.Identifier;
+import net.minecraft.util.WorldSavePath;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import java.nio.file.Path;
 
 public class ChronosMod implements ModInitializer {
 
@@ -61,14 +66,25 @@ public class ChronosMod implements ModInitializer {
     }
 
     private void registerEvents() {
-        ServerLifecycleEvents.SERVER_STARTED.register(RewindManager::setServer);
+        ServerLifecycleEvents.SERVER_STARTED.register(server -> {
+            RewindManager.setServer(server);
+
+            var anchor = PersistenceIO.loadMeta(getChronosDir(server));
+            if (anchor != null) {
+                HistoryManager.initializeClockFromAnchor(anchor.tick(), anchor.epochMillis());
+                LOGGER.info("Chronos : horloge resynchronisée depuis la dernière session");
+            }
+        });
 
         // Tick serveur : avance l'horloge, enregistre joueurs + entités, fait avancer les rewinds actifs
         ServerTickEvents.END_SERVER_TICK.register(server -> {
             HistoryManager.tick();
             PlacementTracker.resolvePending();
 
-            server.getPlayerManager().getPlayerList().forEach(HistoryManager::recordSnapshot);
+            server.getPlayerManager().getPlayerList().forEach(player -> {
+                HistoryManager.recordSnapshot(player);
+                HistoryManager.recordLongTermIfDue(player);
+            });
 
             for (var onlinePlayer : server.getPlayerManager().getPlayerList()) {
                 var nearby = onlinePlayer.getServerWorld().getEntitiesByClass(
@@ -82,6 +98,32 @@ public class ChronosMod implements ModInitializer {
             }
 
             RewindManager.tickAll();
+
+            // Sauvegarde automatique toutes les 5 minutes (filet de sécurité en cas de crash)
+            if (HistoryManager.getCurrentTick() % 6000 == 0) {
+                for (ServerPlayerEntity player : server.getPlayerManager().getPlayerList()) {
+                    PersistenceIO.save(getChronosDir(server), player.getUuid(), HistoryManager.getLongTermHistory(player.getUuid()));
+                }
+                PersistenceIO.saveMeta(getChronosDir(server), HistoryManager.getCurrentTick());
+            }
+        });
+
+        // Un joueur se connecte -> on recharge son historique longue durée depuis le disque
+        net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents.JOIN.register((handler, sender, server) -> {
+            var loaded = PersistenceIO.load(getChronosDir(server), handler.player.getUuid());
+            if (!loaded.isEmpty()) {
+                HistoryManager.setLongTermHistory(handler.player.getUuid(), loaded);
+                LOGGER.info("Chronos : historique longue durée rechargé pour {} ({} points)",
+                        handler.player.getName().getString(), loaded.size());
+            }
+        });
+
+        // Le serveur s'arrête -> on sauvegarde tout le monde avant de fermer
+        ServerLifecycleEvents.SERVER_STOPPING.register(server -> {
+            for (ServerPlayerEntity player : server.getPlayerManager().getPlayerList()) {
+                PersistenceIO.save(getChronosDir(server), player.getUuid(), HistoryManager.getLongTermHistory(player.getUuid()));
+            }
+            PersistenceIO.saveMeta(getChronosDir(server), HistoryManager.getCurrentTick());
         });
 
         // Un animal/monstre meurt -> on garde son NBT complet pour pouvoir le ressusciter
@@ -121,10 +163,16 @@ public class ChronosMod implements ModInitializer {
             return ActionResult.PASS;
         });
 
-        // Nettoyage propre quand un joueur se déconnecte (évite les fuites mémoire)
+        // Un joueur se déconnecte -> on sauvegarde son historique et on libère la mémoire
         net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents.DISCONNECT.register((handler, server) -> {
+            PersistenceIO.save(getChronosDir(server), handler.player.getUuid(), HistoryManager.getLongTermHistory(handler.player.getUuid()));
+            HistoryManager.unloadLongTermFromMemory(handler.player.getUuid());
             RewindManager.clear(handler.player.getUuid());
             HistoryManager.clearPlayerHistory(handler.player.getUuid());
         });
+    }
+
+    private static Path getChronosDir(MinecraftServer server) {
+        return server.getSavePath(WorldSavePath.ROOT).resolve("chronos");
     }
 }

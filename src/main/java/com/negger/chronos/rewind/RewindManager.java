@@ -152,7 +152,7 @@ public class RewindManager {
         UUID id = player.getUuid();
         Session session = SESSIONS.get(id);
         if (session == null) {
-            List<TimeSnapshot> buffer = HistoryManager.snapshotHistory(id);
+            List<TimeSnapshot> buffer = HistoryManager.combinedHistory(id);
             if (buffer.isEmpty()) return null;
             session = new Session();
             session.buffer = buffer;
