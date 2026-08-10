@@ -3,10 +3,12 @@ package com.negger.chronos.rewind;
 import com.negger.chronos.ChronosConfig;
 import com.negger.chronos.history.BlockChange;
 import com.negger.chronos.history.DeathRecord;
+import com.negger.chronos.history.EntitySnapshot;
 import com.negger.chronos.history.HistoryManager;
 import com.negger.chronos.history.TimeSnapshot;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.EntityType;
+import net.minecraft.entity.LivingEntity;
 import net.minecraft.item.ItemStack;
 import net.minecraft.nbt.NbtCompound;
 import net.minecraft.particle.ParticleTypes;
@@ -14,9 +16,7 @@ import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.sound.SoundCategory;
 import net.minecraft.sound.SoundEvents;
 import net.minecraft.text.Text;
-import net.minecraft.util.Identifier;
 
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -24,54 +24,172 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Gère les sessions de rewind par joueur (tenu en main OU en lecture auto)
- * et les points de sauvegarde. Une session ne détruit jamais l'historique de
- * position : elle se contente de "naviguer" dedans avec un curseur, donc on
- * peut toujours revenir en avant. Les blocs, eux, sont dépilés/rempilés
- * (undo/redo) pour rester cohérents avec ce qui a été rejoué.
+ * Gère les sessions de rewind par joueur.
+ *
+ * IMPORTANT : tout est piloté par le clic droit uniquement (tap = action
+ * rapide, maintien = action continue). Le clic gauche a été abandonné car
+ * il nécessitait un mixin pas fiable à 100% sans pouvoir être testé.
+ *
+ * - Pas accroupi, clic droit RAPIDE (relâché avant SEUIL_TAP)  -> retour au présent (timelapse)
+ * - Pas accroupi, clic droit MAINTENU au-delà du seuil          -> rembobine tant que maintenu
+ * - Accroupi, clic droit RAPIDE                                  -> pose un point de sauvegarde
+ * - Accroupi, clic droit MAINTENU au-delà du seuil               -> file vers le point de sauvegarde (timelapse, continue même après avoir relâché)
+ *
+ * Le mouvement ne démarre JAMAIS avant que le seuil soit dépassé : ça évite
+ * tout micro-recul/flash qui casserait l'immersion sur un simple tap.
  */
 public class RewindManager {
+
+    private static final int TAP_THRESHOLD_TICKS = 6; // ~0.3s : en dessous, c'est un tap
+    private static final int ENTITY_MATCH_WINDOW = 4;  // tolérance en ticks pour retrouver le snapshot d'une entité
 
     private enum Mode { HELD_BACKWARD, AUTO_FORWARD, AUTO_TO_TARGET }
 
     private static class Session {
         List<TimeSnapshot> buffer; // du plus vieux au plus récent
-        int cursor;                // index actuellement affiché dans buffer
-        Mode mode;
-        Integer targetCursor;      // utilisé pour AUTO_TO_TARGET
+        int cursor;
+        Mode mode; // null = en pause, figé
+        Integer targetCursor;
+    }
+
+    private static class PendingPress {
+        long startTick;
+        boolean sneaking;
+        boolean promoted;
     }
 
     private static final Map<UUID, Session> SESSIONS = new ConcurrentHashMap<>();
     private static final Map<UUID, TimeSnapshot> SAVEPOINTS = new ConcurrentHashMap<>();
+    private static final Map<UUID, PendingPress> PENDING = new ConcurrentHashMap<>();
 
-    // ----- Point d'entrée : clic droit (maintenu) sans être accroupi -----
+    private static net.minecraft.server.MinecraftServer CURRENT_SERVER;
+    public static void setServer(net.minecraft.server.MinecraftServer server) {
+        CURRENT_SERVER = server;
+    }
 
-    public static boolean startOrResumeHeldBackward(ServerPlayerEntity player) {
+    // ----- Appelé par Item#use() à chaque clic droit (avant de savoir si ce sera un tap ou un maintien) -----
+
+    public static boolean onRightClickPress(ServerPlayerEntity player) {
+        UUID id = player.getUuid();
+        boolean sneaking = player.isSneaking();
+
+        if (!sneaking && HistoryManager.getPlayerHistorySize(id) == 0 && !isRewinding(id)) {
+            return false; // rien à faire : jamais rien enregistré
+        }
+
+        PendingPress pending = new PendingPress();
+        pending.startTick = HistoryManager.getCurrentTick();
+        pending.sneaking = sneaking;
+        pending.promoted = false;
+        PENDING.put(id, pending);
+        return true;
+    }
+
+    // ----- Appelé par Item#onStoppedUsing() quand le joueur relâche le clic -----
+
+    public static void onRightClickRelease(ServerPlayerEntity player) {
+        UUID id = player.getUuid();
+        PendingPress pending = PENDING.remove(id);
+        if (pending == null) return; // déjà promu et géré ailleurs, ou rien en cours
+
+        if (!pending.promoted) {
+            // Relâché avant le seuil : c'était un tap
+            if (pending.sneaking) {
+                setSavepoint(player);
+            } else {
+                onReturnToPresent(player);
+            }
+        } else {
+            // Maintien réel qui vient de s'arrêter
+            if (!pending.sneaking) {
+                Session session = SESSIONS.get(id);
+                if (session != null) session.mode = null; // reste figé où il est
+            }
+            // si sneaking : la session AUTO_TO_TARGET continue toute seule (timelapse), on ne touche à rien
+        }
+    }
+
+    // ----- Boucle principale : appelée chaque tick serveur -----
+
+    public static void tickAll() {
+        // 1. Promotion des pressions maintenues au-delà du seuil
+        for (Map.Entry<UUID, PendingPress> entry : PENDING.entrySet()) {
+            PendingPress pending = entry.getValue();
+            if (pending.promoted) continue;
+            if (HistoryManager.getCurrentTick() - pending.startTick < TAP_THRESHOLD_TICKS) continue;
+
+            ServerPlayerEntity player = findPlayer(entry.getKey());
+            if (player == null) continue;
+
+            pending.promoted = true;
+            if (pending.sneaking) {
+                beginScrubToSavepoint(player);
+            } else {
+                beginHeldBackward(player);
+            }
+        }
+
+        // 2. Avance des sessions actives
+        for (Map.Entry<UUID, Session> entry : SESSIONS.entrySet()) {
+            Session session = entry.getValue();
+            if (session.mode == null) continue;
+
+            ServerPlayerEntity player = findPlayer(entry.getKey());
+            if (player == null) continue;
+
+            int steps = Math.max(1, (int) Math.round(ChronosConfig.rewindSpeed));
+            for (int i = 0; i < steps; i++) {
+                if (!advanceOneStep(player, session)) break;
+            }
+        }
+    }
+
+    private static ServerPlayerEntity findPlayer(UUID id) {
+        return CURRENT_SERVER == null ? null : CURRENT_SERVER.getPlayerManager().getPlayer(id);
+    }
+
+    private static Session getOrCreateSession(ServerPlayerEntity player) {
         UUID id = player.getUuid();
         Session session = SESSIONS.get(id);
-
         if (session == null) {
             List<TimeSnapshot> buffer = HistoryManager.snapshotHistory(id);
-            if (buffer.isEmpty()) return false;
+            if (buffer.isEmpty()) return null;
             session = new Session();
             session.buffer = buffer;
             session.cursor = buffer.size() - 1;
             SESSIONS.put(id, session);
             HistoryManager.setPaused(id, true);
         }
+        return session;
+    }
 
-        if (session.cursor <= 0) return false; // déjà au bout de l'historique connu
+    private static void beginHeldBackward(ServerPlayerEntity player) {
+        Session session = getOrCreateSession(player);
+        if (session == null) return;
+        if (session.cursor <= 0) {
+            player.sendMessage(Text.literal("§6Tu as atteint la limite de ton historique."), true);
+            return;
+        }
         session.mode = Mode.HELD_BACKWARD;
         session.targetCursor = null;
-        return true;
     }
 
-    public static void pauseHeld(ServerPlayerEntity player) {
-        Session session = SESSIONS.get(player.getUuid());
-        if (session != null) session.mode = null;
+    private static void beginScrubToSavepoint(ServerPlayerEntity player) {
+        UUID id = player.getUuid();
+        TimeSnapshot savepoint = SAVEPOINTS.get(id);
+        if (savepoint == null) {
+            player.sendMessage(Text.literal("§cAucun point de sauvegarde posé. Tape un clic droit rapide en étant accroupi d'abord."), true);
+            return;
+        }
+        Session session = getOrCreateSession(player);
+        if (session == null) return;
+
+        int target = closestIndexForTick(session.buffer, savepoint.tick());
+        session.mode = Mode.AUTO_TO_TARGET;
+        session.targetCursor = target;
     }
 
-    // ----- Clic gauche : retour au présent (si pas accroupi) -----
+    // ----- Retour au présent (déclenché par un tap sans être accroupi) -----
 
     public static void onReturnToPresent(ServerPlayerEntity player) {
         Session session = SESSIONS.get(player.getUuid());
@@ -83,7 +201,7 @@ public class RewindManager {
         session.targetCursor = session.buffer.size() - 1;
     }
 
-    // ----- Accroupi + clic droit : poser un point de sauvegarde -----
+    // ----- Poser un point de sauvegarde (déclenché par un tap en étant accroupi) -----
 
     public static void setSavepoint(ServerPlayerEntity player) {
         UUID id = player.getUuid();
@@ -109,32 +227,6 @@ public class RewindManager {
         player.sendMessage(Text.literal("§dPoint de sauvegarde posé."), true);
     }
 
-    // ----- Accroupi + clic gauche : revenir au point de sauvegarde (timelapse) -----
-
-    public static void onRestoreSavepoint(ServerPlayerEntity player) {
-        UUID id = player.getUuid();
-        TimeSnapshot savepoint = SAVEPOINTS.get(id);
-        if (savepoint == null) {
-            player.sendMessage(Text.literal("§cAucun point de sauvegarde posé. Accroupis-toi + clic droit d'abord."), true);
-            return;
-        }
-
-        Session session = SESSIONS.get(id);
-        if (session == null) {
-            List<TimeSnapshot> buffer = HistoryManager.snapshotHistory(id);
-            if (buffer.isEmpty()) return;
-            session = new Session();
-            session.buffer = buffer;
-            session.cursor = buffer.size() - 1;
-            SESSIONS.put(id, session);
-            HistoryManager.setPaused(id, true);
-        }
-
-        int target = closestIndexForTick(session.buffer, savepoint.tick());
-        session.mode = Mode.AUTO_TO_TARGET;
-        session.targetCursor = target;
-    }
-
     private static int closestIndexForTick(List<TimeSnapshot> buffer, long tick) {
         int best = 0;
         long bestDiff = Long.MAX_VALUE;
@@ -148,33 +240,7 @@ public class RewindManager {
         return best;
     }
 
-    // ----- Boucle principale : appelée chaque tick serveur pour chaque joueur -----
-
-    public static void tickAll() {
-        for (Map.Entry<UUID, Session> entry : SESSIONS.entrySet()) {
-            Session session = entry.getValue();
-            if (session.mode == null) continue; // en pause, rien à faire (figé dans le passé)
-
-            ServerPlayerEntity player = findPlayer(entry.getKey());
-            if (player == null) continue;
-
-            int steps = Math.max(1, (int) Math.round(ChronosConfig.rewindSpeed));
-            for (int i = 0; i < steps; i++) {
-                if (!advanceOneStep(player, session)) break;
-            }
-        }
-    }
-
-    private static ServerPlayerEntity findPlayer(UUID id) {
-        return CURRENT_SERVER == null ? null : CURRENT_SERVER.getPlayerManager().getPlayer(id);
-    }
-
-    private static net.minecraft.server.MinecraftServer CURRENT_SERVER;
-    public static void setServer(net.minecraft.server.MinecraftServer server) {
-        CURRENT_SERVER = server;
-    }
-
-    /** Renvoie false si la session est terminée (arrivée à destination ou plus rien à jouer). */
+    /** Renvoie false si la session est terminée. */
     private static boolean advanceOneStep(ServerPlayerEntity player, Session session) {
         boolean backward = switch (session.mode) {
             case HELD_BACKWARD -> true;
@@ -196,6 +262,7 @@ public class RewindManager {
         } else {
             replayBlocks(player, newTick);
         }
+        restoreEntityPositions(newTick);
 
         session.cursor = newCursor;
         applySnapshot(player, session.buffer.get(newCursor));
@@ -210,24 +277,25 @@ public class RewindManager {
             return false;
         }
         if (reachedStart) {
-            session.mode = null; // reste figé, en pause, prêt à reprendre plus tard
+            session.mode = null;
             player.sendMessage(Text.literal("§6Tu as atteint la limite de ton historique."), true);
-            player.stopUsingItem();
             return false;
         }
         return true;
     }
 
     private static void finishSession(ServerPlayerEntity player, Session session) {
-        if (session.mode == Mode.AUTO_FORWARD || (session.mode == Mode.AUTO_TO_TARGET && session.cursor >= session.buffer.size() - 1)) {
+        boolean backToPresent = session.mode == Mode.AUTO_FORWARD
+                || (session.mode == Mode.AUTO_TO_TARGET && session.cursor >= session.buffer.size() - 1);
+
+        if (backToPresent) {
             SESSIONS.remove(player.getUuid());
             HistoryManager.setPaused(player.getUuid(), false);
             player.sendMessage(Text.literal("§bRetour au présent."), true);
         } else {
-            session.mode = null; // point de sauvegarde atteint : on reste figé là, en pause
+            session.mode = null; // figé au point de sauvegarde, prêt pour une prochaine action
             player.sendMessage(Text.literal("§dPoint de sauvegarde atteint."), true);
         }
-        player.stopUsingItem();
     }
 
     private static void applySnapshot(ServerPlayerEntity player, TimeSnapshot snapshot) {
@@ -239,6 +307,41 @@ public class RewindManager {
         }
     }
 
+    // ----- Entités (animaux/mobs) : repositionnement + résurrection -----
+
+    private static void restoreEntityPositions(long targetTick) {
+        if (CURRENT_SERVER == null) return;
+        List<EntitySnapshot> snaps = HistoryManager.getEntitySnapshotsNear(
+                targetTick, targetTick - ENTITY_MATCH_WINDOW, targetTick + ENTITY_MATCH_WINDOW);
+
+        for (EntitySnapshot snap : snaps) {
+            for (var world : CURRENT_SERVER.getWorlds()) {
+                Entity entity = world.getEntity(snap.entityUuid());
+                if (entity instanceof LivingEntity living) {
+                    living.refreshPositionAndAngles(snap.x(), snap.y(), snap.z(), snap.yaw(), snap.pitch());
+                    if (ChronosConfig.restoreHealthAndHunger) {
+                        living.setHealth(snap.health());
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    private static void reviveEntity(ServerPlayerEntity player, DeathRecord death) {
+        Optional<EntityType<?>> type = EntityType.get(death.entityTypeId());
+        if (type.isEmpty()) return;
+
+        Entity entity = type.get().create(player.getServerWorld());
+        if (entity == null) return;
+
+        NbtCompound nbt = death.nbt().copy();
+        nbt.remove("UUID");
+        entity.readNbt(nbt);
+        entity.refreshPositionAndAngles(death.x(), death.y(), death.z(), entity.getYaw(), entity.getPitch());
+        player.getServerWorld().spawnEntity(entity);
+    }
+
     // ----- Blocs : annuler en reculant, rejouer en avançant -----
 
     private static void revertBlocksAndEntities(ServerPlayerEntity player, long newTick, long oldTick) {
@@ -247,7 +350,6 @@ public class RewindManager {
             player.getServerWorld().setBlockState(change.pos(), change.oldState());
             giveOrTakeItemForRevert(player, change);
         }
-
         for (DeathRecord death : HistoryManager.popDeathsBetween(newTick + 1, oldTick)) {
             reviveEntity(player, death);
         }
@@ -261,7 +363,6 @@ public class RewindManager {
         }
     }
 
-    /** Undo d'un BREAK = le bloc réapparaît -> on retire l'item de l'inventaire. Undo d'un PLACE = le bloc disparaît -> on rend l'item. */
     private static void giveOrTakeItemForRevert(ServerPlayerEntity player, BlockChange change) {
         if (change.type() == BlockChange.ChangeType.BREAK) {
             removeOneMatchingItem(player, change.oldState().getBlock().asItem());
@@ -270,7 +371,6 @@ public class RewindManager {
         }
     }
 
-    /** Redo d'un BREAK = le bloc disparaît -> on rend l'item. Redo d'un PLACE = le bloc réapparaît -> on retire l'item. */
     private static void giveOrTakeItemForReplay(ServerPlayerEntity player, BlockChange change) {
         if (change.type() == BlockChange.ChangeType.BREAK) {
             giveItem(player, change.oldState().getBlock().asItem());
@@ -299,20 +399,6 @@ public class RewindManager {
         }
     }
 
-    private static void reviveEntity(ServerPlayerEntity player, DeathRecord death) {
-        Optional<EntityType<?>> type = EntityType.get(death.entityTypeId());
-        if (type.isEmpty()) return;
-
-        Entity entity = type.get().create(player.getServerWorld());
-        if (entity == null) return;
-
-        NbtCompound nbt = death.nbt().copy();
-        nbt.remove("UUID"); // évite un conflit si un fantôme de l'ancienne entité traîne encore
-        entity.readNbt(nbt);
-        entity.refreshPositionAndAngles(death.x(), death.y(), death.z(), entity.getYaw(), entity.getPitch());
-        player.getServerWorld().spawnEntity(entity);
-    }
-
     private static void playFeedback(ServerPlayerEntity player, boolean backward) {
         if (player.age % 4 != 0) return;
         var world = player.getServerWorld();
@@ -323,15 +409,10 @@ public class RewindManager {
     }
 
     public static boolean isRewinding(UUID playerUuid) {
-        Session s = SESSIONS.get(playerUuid);
-        return s != null;
+        return SESSIONS.containsKey(playerUuid);
     }
 
-    /**
-     * Revert instantané (pas en timelapse) utilisé par /chronos back : annule
-     * tous les changements de blocs de ce joueur et ressuscite les entités
-     * mortes entre targetTick et maintenant. Renvoie le nombre de blocs restaurés.
-     */
+    /** Revert instantané utilisé par /chronos back. Renvoie le nombre de blocs restaurés. */
     public static int revertInstantTo(ServerPlayerEntity player, long targetTick) {
         int count = 0;
         BlockChange change;
@@ -349,6 +430,7 @@ public class RewindManager {
     public static void clear(UUID playerUuid) {
         SESSIONS.remove(playerUuid);
         SAVEPOINTS.remove(playerUuid);
+        PENDING.remove(playerUuid);
         HistoryManager.setPaused(playerUuid, false);
     }
 }

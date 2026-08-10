@@ -70,11 +70,14 @@ public class ChronosMod implements ModInitializer {
 
             server.getPlayerManager().getPlayerList().forEach(HistoryManager::recordSnapshot);
 
-            for (ServerWorld world : server.getWorlds()) {
-                for (net.minecraft.entity.Entity entity : world.iterateEntities()) {
-                    if (entity instanceof LivingEntity living && !(entity instanceof PlayerEntity)) {
-                        HistoryManager.recordEntitySnapshot(living);
-                    }
+            for (var onlinePlayer : server.getPlayerManager().getPlayerList()) {
+                var nearby = onlinePlayer.getServerWorld().getEntitiesByClass(
+                        LivingEntity.class,
+                        onlinePlayer.getBoundingBox().expand(96),
+                        e -> !(e instanceof PlayerEntity)
+                );
+                for (LivingEntity living : nearby) {
+                    HistoryManager.recordEntitySnapshot(living);
                 }
             }
 

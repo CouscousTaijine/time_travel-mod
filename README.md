@@ -15,18 +15,30 @@ craftable : l'**Éclat Chronos**.
 
 ### Contrôles de l'Éclat Chronos
 
+**Tout se joue au clic droit uniquement** (le clic gauche a été abandonné —
+Minecraft n'a pas de mécanisme fiable pour "clic gauche avec un item en main
+sans viser quoi que ce soit" sans passer par un mixin réseau, ce qui s'est
+avéré instable). La distinction se fait entre un **tap** (clic rapide,
+relâché en moins de 0,3s) et un **maintien** :
+
 | Action | Effet |
 |---|---|
-| Clic droit **maintenu** | Rembobine en arrière, en direct (timelapse) |
-| Clic gauche | Repart en avant jusqu'au présent, en direct (timelapse) |
-| Accroupi + clic droit | Pose un point de sauvegarde à l'instant présent |
-| Accroupi + clic gauche | Revient à ce point de sauvegarde (timelapse, pas instantané) |
+| Tap (clic rapide) | Retour au présent, en timelapse |
+| Maintien | Rembobine en arrière tant que maintenu, en timelapse |
+| Accroupi + tap | Pose un point de sauvegarde à l'instant présent |
+| Accroupi + maintien | File vers ce point de sauvegarde, en timelapse (continue même si tu relâches en cours de route) |
+
+Le mouvement ne démarre jamais avant que le seuil de 0,3s soit dépassé — un
+simple tap ne provoque donc aucun micro-saut visuel qui casserait
+l'immersion.
 
 En reculant : les blocs que tu as cassés réapparaissent (et l'item correspondant
 est retiré de ton inventaire), les blocs que tu as posés disparaissent (et
 l'item te revient), les animaux/monstres tués dans cette fenêtre ressuscitent
-à leur position d'origine. En avançant (retour au présent), tout est rejoué
-dans l'autre sens pour les blocs.
+à leur position d'origine, et les animaux encore vivants sont repositionnés
+à leur emplacement d'origine au fil du rembobinage. En avançant (retour au
+présent), les blocs sont rejoués dans l'autre sens (le repositionnement des
+animaux ne l'est pas, pour rester simple).
 
 ### Commande de secours
 
@@ -77,12 +89,12 @@ l'item.
 - La résurrection des animaux/monstres est du "best effort" : ça recrée une
   nouvelle entité à partir du NBT sauvegardé (nom, apparence, état identiques)
   mais ce n'est techniquement pas l'entité d'origine — elle aura un nouvel ID interne.
+- Le repositionnement des animaux/monstres encore vivants ne se fait que sur
+  ceux qui étaient à moins de 96 blocs d'un joueur au moment de l'enregistrement
+  (pour ne pas surcharger le serveur en calculant pour toute la carte).
 - En multijoueur, si deux joueurs rembobinent en même temps très près l'un de
   l'autre, il peut y avoir des interférences sur les entités partagées (les
   blocs, eux, sont gérés par joueur donc sans conflit entre vous).
-- Le clic gauche est intercepté via un petit mixin (`HandSwingMixin`) parce que
-  Minecraft n'a pas d'event tout fait pour "clic gauche avec un item en main
-  sans rien viser".
 
 ## Compiler SANS rien installer (méthode simple)
 

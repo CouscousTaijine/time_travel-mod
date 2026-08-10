@@ -1,28 +1,27 @@
 package com.negger.chronos.item;
 
-import com.negger.chronos.history.HistoryManager;
 import com.negger.chronos.rewind.RewindManager;
 import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
 import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.text.Text;
-import net.minecraft.util.ActionResult;
 import net.minecraft.util.Hand;
 import net.minecraft.util.TypedActionResult;
 import net.minecraft.util.UseAction;
 import net.minecraft.world.World;
 
 /**
- * Éclat Chronos.
+ * Éclat Chronos. Tout se joue au clic droit (tap = rapide, maintien = long) :
  *
- * - Clic droit maintenu (pas accroupi)  -> rembobine en arrière, en direct (timelapse)
- * - Clic gauche (pas accroupi)          -> repart en avant jusqu'au présent (timelapse)
- * - Accroupi + clic droit               -> pose un point de sauvegarde à l'instant présent
- * - Accroupi + clic gauche              -> revient à ce point de sauvegarde (timelapse)
+ * - Pas accroupi, TAP        -> retour au présent (timelapse)
+ * - Pas accroupi, MAINTIEN   -> rembobine en arrière tant que maintenu (timelapse)
+ * - Accroupi, TAP            -> pose un point de sauvegarde
+ * - Accroupi, MAINTIEN       -> file vers le point de sauvegarde (timelapse)
  *
- * Le clic gauche n'existe pas nativement comme "action d'objet" en Minecraft
- * (c'est une attaque), donc il est intercepté côté serveur par un mixin
- * (voir mixin/HandSwingMixin.java) qui appelle RewindManager directement.
+ * La distinction tap/maintien est faite via la durée réelle d'utilisation
+ * (voir RewindManager.onRightClickPress / onRightClickRelease). Le mouvement
+ * ne commence qu'une fois le seuil de maintien dépassé, donc un simple tap
+ * ne provoque jamais de micro-saut visuel.
  */
 public class ChronosShardItem extends Item {
 
@@ -48,20 +47,9 @@ public class ChronosShardItem extends Item {
             return TypedActionResult.consume(user.getStackInHand(hand));
         }
 
-        if (player.isSneaking()) {
-            // Accroupi + clic droit = poser un point de sauvegarde (action instantanée)
-            RewindManager.setSavepoint(player);
-            return TypedActionResult.success(user.getStackInHand(hand));
-        }
-
-        if (HistoryManager.getPlayerHistorySize(player.getUuid()) == 0 && !RewindManager.isRewinding(player.getUuid())) {
+        boolean accepted = RewindManager.onRightClickPress(player);
+        if (!accepted) {
             player.sendMessage(Text.literal("§7Aucun historique à remonter pour l'instant. Bouge un peu d'abord."), true);
-            return TypedActionResult.fail(user.getStackInHand(hand));
-        }
-
-        boolean started = RewindManager.startOrResumeHeldBackward(player);
-        if (!started) {
-            player.sendMessage(Text.literal("§6Tu as atteint la limite de ton historique."), true);
             return TypedActionResult.fail(user.getStackInHand(hand));
         }
 
@@ -71,15 +59,13 @@ public class ChronosShardItem extends Item {
 
     @Override
     public void usageTick(World world, net.minecraft.entity.LivingEntity user, ItemStack stack, int remainingUseTicks) {
-        // Le vrai travail est fait une fois par tick serveur pour tout le monde
-        // par RewindManager.tickAll() (voir ChronosMod). Ici on ne fait que
-        // garder l'item "en cours d'utilisation" tant que le clic est maintenu.
+        // Le vrai travail est fait chaque tick serveur par RewindManager.tickAll() (voir ChronosMod)
     }
 
     @Override
     public void onStoppedUsing(ItemStack stack, World world, net.minecraft.entity.LivingEntity user, int remainingUseTicks) {
         if (!world.isClient && user instanceof ServerPlayerEntity player) {
-            RewindManager.pauseHeld(player);
+            RewindManager.onRightClickRelease(player);
         }
     }
 }

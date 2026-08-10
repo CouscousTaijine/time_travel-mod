@@ -12,7 +12,7 @@
   "entrypoints": {
     "main": ["com.negger.chronos.ChronosMod"]
   },
-  "mixins": ["chronos.mixins.json"],
+  "mixins": [],
   "depends": {
     "fabricloader": ">=0.15.0",
     "minecraft": "~1.20.1",

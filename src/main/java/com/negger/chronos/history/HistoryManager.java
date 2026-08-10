@@ -190,6 +190,24 @@ public class HistoryManager {
         }
     }
 
+    /** Renvoie le snapshot le plus proche du tick demandé pour chaque entité (une entrée par UUID). */
+    public static List<EntitySnapshot> getEntitySnapshotsNear(long targetTick, long minTick, long maxTick) {
+        synchronized (ENTITY_HISTORY) {
+            Map<UUID, EntitySnapshot> best = new java.util.HashMap<>();
+            Map<UUID, Long> bestDiff = new java.util.HashMap<>();
+            for (EntitySnapshot s : ENTITY_HISTORY) {
+                if (s.tick() < minTick || s.tick() > maxTick) continue;
+                long diff = Math.abs(s.tick() - targetTick);
+                Long current = bestDiff.get(s.entityUuid());
+                if (current == null || diff < current) {
+                    bestDiff.put(s.entityUuid(), diff);
+                    best.put(s.entityUuid(), s);
+                }
+            }
+            return new ArrayList<>(best.values());
+        }
+    }
+
     public static void recordDeath(DeathRecord record) {
         synchronized (DEATH_RECORDS) {
             DEATH_RECORDS.addLast(record);
