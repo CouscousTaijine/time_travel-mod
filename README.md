@@ -43,7 +43,7 @@ animaux ne l'est pas, pour rester simple).
 ### Commande de secours
 
 ```
-/chronos back 20    -> saute 20 minutes en arrière, instantanément (pas en timelapse)
+/chronos back 90    -> saute 90 secondes en arrière, instantanément (pas en timelapse)
 /chronos status      -> combien de temps d'historique il te reste
 ```
 

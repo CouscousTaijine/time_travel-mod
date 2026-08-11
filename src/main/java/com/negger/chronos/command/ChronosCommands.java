@@ -15,17 +15,17 @@ import net.minecraft.text.Text;
 import java.util.List;
 
 /**
- * /chronos back <minutes>  -> saut instantané précis dans le passé (pas en timelapse,
- *                              contrairement à l'item — c'est fait exprès, pour un usage
- *                              rapide en admin/debug)
- * /chronos status          -> combien de temps d'historique il te reste
+ * /chronos back <secondes>  -> saut instantané précis dans le passé (pas en timelapse,
+ *                               contrairement à l'item — c'est fait exprès, pour un usage
+ *                               rapide en admin/debug)
+ * /chronos status            -> combien de temps d'historique il te reste
  */
 public class ChronosCommands {
 
     public static void register(CommandDispatcher<ServerCommandSource> dispatcher) {
         dispatcher.register(CommandManager.literal("chronos")
                 .then(CommandManager.literal("back")
-                        .then(CommandManager.argument("minutes", FloatArgumentType.floatArg(0.01f))
+                        .then(CommandManager.argument("secondes", FloatArgumentType.floatArg(0.05f))
                                 .executes(ChronosCommands::executeBack)))
                 .then(CommandManager.literal("status")
                         .executes(ChronosCommands::executeStatus))
@@ -36,8 +36,8 @@ public class ChronosCommands {
         ServerCommandSource source = ctx.getSource();
         ServerPlayerEntity player = source.getPlayer();
 
-        float minutes = FloatArgumentType.getFloat(ctx, "minutes");
-        int ticksRequested = Math.round(minutes * 60 * 20);
+        float seconds = FloatArgumentType.getFloat(ctx, "secondes");
+        int ticksRequested = Math.round(seconds * 20);
 
         List<TimeSnapshot> history = HistoryManager.combinedHistory(player.getUuid());
         if (history.isEmpty()) {
@@ -68,15 +68,15 @@ public class ChronosCommands {
             player.getHungerManager().setSaturationLevel(target.saturation());
         }
 
-        double actualMinutes = actualTicks / 20.0 / 60.0;
+        double actualSeconds = actualTicks / 20.0;
         if (actualTicks < ticksRequested) {
             player.sendMessage(Text.literal(String.format(
-                    "§6Ton historique ne remontait pas si loin. Saut de %.1f min au lieu de %.1f min demandées (%d blocs restaurés).",
-                    actualMinutes, (double) minutes, reverted)), false);
+                    "§6Ton historique ne remontait pas si loin. Saut de %.1f s au lieu de %.1f s demandées (%d blocs restaurés).",
+                    actualSeconds, (double) seconds, reverted)), false);
         } else {
             player.sendMessage(Text.literal(String.format(
-                    "§bSaut de %.1f min dans le passé effectué (%d blocs restaurés).",
-                    actualMinutes, reverted)), false);
+                    "§bSaut de %.1f s dans le passé effectué (%d blocs restaurés).",
+                    actualSeconds, reverted)), false);
         }
 
         return 1;
