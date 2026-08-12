@@ -2,7 +2,12 @@ package com.negger.chronos.history;
 
 import com.negger.chronos.ChronosConfig;
 import net.minecraft.entity.LivingEntity;
+import net.minecraft.nbt.NbtCompound;
+import net.minecraft.nbt.NbtList;
 import net.minecraft.server.network.ServerPlayerEntity;
+import net.minecraft.server.world.ServerWorld;
+import net.minecraft.util.math.BlockPos;
+import net.minecraft.world.World;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -22,10 +27,13 @@ public class HistoryManager {
     private static final Map<UUID, Deque<BlockChange>> BLOCK_UNDO_STACK = new ConcurrentHashMap<>();
     private static final Deque<EntitySnapshot> ENTITY_HISTORY = new ArrayDeque<>();
     private static final Deque<DeathRecord> DEATH_RECORDS = new ArrayDeque<>();
+    private static volatile boolean RESTORING = false;
     private static long currentTick = 0;
 
     public static void tick() { currentTick++; }
     public static long getCurrentTick() { return currentTick; }
+    public static void setRestoring(boolean value) { RESTORING = value; }
+    public static boolean isRestoring() { return RESTORING; }
 
     public static void initializeClockFromAnchor(long anchorTick, long anchorEpochMillis) {
         long elapsedMillis = System.currentTimeMillis() - anchorEpochMillis;
@@ -39,12 +47,27 @@ public class HistoryManager {
     public static boolean isPaused(UUID playerUuid) { return PAUSED_PLAYERS.contains(playerUuid); }
 
     public static void recordSnapshot(ServerPlayerEntity player) {
-        if (isPaused(player.getUuid())) return;
+        if (isPaused(player.getUuid()) || RESTORING) return;
         Deque<TimeSnapshot> history = PLAYER_HISTORY.computeIfAbsent(player.getUuid(), id -> new ArrayDeque<>());
-        history.addLast(new TimeSnapshot(currentTick, player.getX(), player.getY(), player.getZ(),
+        NbtCompound playerNbt = new NbtCompound();
+        player.writeNbt(playerNbt);
+        NbtList inventory = playerNbt.getList("Inventory", 10).copy();
+        history.addLast(new TimeSnapshot(
+                currentTick,
+                player.getX(), player.getY(), player.getZ(),
                 player.getYaw(), player.getPitch(), player.getHealth(),
-                player.getHungerManager().getFoodLevel(), player.getHungerManager().getSaturationLevel(),
-                player.getServerWorld().getTime()));
+                player.getHungerManager().getFoodLevel(),
+                player.getHungerManager().getSaturationLevel(),
+                player.getServerWorld().getTimeOfDay(),
+                player.getServerWorld().isRaining(),
+                player.getServerWorld().isThundering(),
+                player.getServerWorld().getPersistentStateManager() != null
+                        ? player.getServerWorld().getServer().getOverworld().getPersistentStateManager() == null ? 0 : player.getServerWorld().getLevelProperties().getClearWeatherTime()
+                        : 0,
+                player.getServerWorld().getLevelProperties().getRainTime(),
+                player.getServerWorld().getLevelProperties().getThunderTime(),
+                inventory
+        ));
         int maxSize = ChronosConfig.getBufferTicks();
         while (history.size() > maxSize) history.pollFirst();
     }
@@ -55,12 +78,11 @@ public class HistoryManager {
     }
 
     public static void recordLongTermIfDue(ServerPlayerEntity player) {
-        if (!ChronosConfig.persistenceEnabled || isPaused(player.getUuid()) || currentTick % 20 != 0) return;
+        if (!ChronosConfig.persistenceEnabled || isPaused(player.getUuid()) || RESTORING || currentTick % 20 != 0) return;
         Deque<TimeSnapshot> history = LONG_TERM_HISTORY.computeIfAbsent(player.getUuid(), id -> new ArrayDeque<>());
-        history.addLast(new TimeSnapshot(currentTick, player.getX(), player.getY(), player.getZ(),
-                player.getYaw(), player.getPitch(), player.getHealth(),
-                player.getHungerManager().getFoodLevel(), player.getHungerManager().getSaturationLevel(),
-                player.getServerWorld().getTime()));
+        List<TimeSnapshot> shortHistory = snapshotHistory(player.getUuid());
+        TimeSnapshot latest = shortHistory.isEmpty() ? null : shortHistory.get(shortHistory.size() - 1);
+        if (latest != null) history.addLast(latest);
         long maxSize = ChronosConfig.getPersistCapacity();
         while (history.size() > maxSize) history.pollFirst();
     }
@@ -101,14 +123,28 @@ public class HistoryManager {
     public static void unloadLongTermFromMemory(UUID playerUuid) { LONG_TERM_HISTORY.remove(playerUuid); }
 
     public static void recordBlockChange(BlockChange change) {
+        if (RESTORING) return;
         Deque<BlockChange> history = BLOCK_HISTORY.computeIfAbsent(change.playerUuid(), id -> new ArrayDeque<>());
         synchronized (history) {
+            BlockChange last = history.peekLast();
+            if (last != null && last.tick() == change.tick() && last.pos().equals(change.pos())
+                    && last.oldState().equals(change.oldState()) && last.newState().equals(change.newState())) return;
             history.addLast(change);
-            int maxSize = ChronosConfig.getBufferTicks();
+            int maxSize = ChronosConfig.getBufferTicks() * 4;
             while (history.size() > maxSize) history.pollFirst();
         }
         Deque<BlockChange> undo = BLOCK_UNDO_STACK.get(change.playerUuid());
         if (undo != null) undo.clear();
+    }
+
+    public static void recordWorldBlockChange(ServerWorld world, BlockPos pos, net.minecraft.block.BlockState oldState, net.minecraft.block.BlockState newState) {
+        if (RESTORING || oldState.equals(newState)) return;
+        if (world.getServer() == null) return;
+        for (ServerPlayerEntity player : world.getServer().getPlayerManager().getPlayerList()) {
+            if (player.getServerWorld() != world || isPaused(player.getUuid())) continue;
+            recordBlockChange(new BlockChange(currentTick, pos.toImmutable(), oldState, newState, player.getUuid(),
+                    newState.isAir() ? BlockChange.ChangeType.BREAK : BlockChange.ChangeType.PLACE));
+        }
     }
 
     public static BlockChange popMatchingBlockChange(UUID playerUuid, long minTick) {
@@ -136,6 +172,7 @@ public class HistoryManager {
     }
 
     public static void recordEntitySnapshot(LivingEntity entity) {
+        if (RESTORING) return;
         synchronized (ENTITY_HISTORY) {
             ENTITY_HISTORY.addLast(new EntitySnapshot(currentTick, entity.getUuid(), entity.getX(), entity.getY(), entity.getZ(), entity.getYaw(), entity.getPitch(), entity.getHealth()));
             int maxSize = ChronosConfig.getBufferTicks() * 8;
@@ -166,6 +203,7 @@ public class HistoryManager {
     }
 
     public static void recordDeath(DeathRecord record) {
+        if (RESTORING) return;
         synchronized (DEATH_RECORDS) {
             DEATH_RECORDS.addLast(record);
             while (DEATH_RECORDS.size() > 2000) DEATH_RECORDS.pollFirst();
