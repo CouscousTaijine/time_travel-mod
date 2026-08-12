@@ -57,6 +57,7 @@ public class HistoryManager {
                 currentTick, player.getX(), player.getY(), player.getZ(), player.getYaw(), player.getPitch(),
                 player.getHealth(), player.getHungerManager().getFoodLevel(), player.getHungerManager().getSaturationLevel(),
                 player.experienceLevel, player.totalExperience, player.experienceProgress,
+                player.getInventory().selectedSlot,
                 props.getTimeOfDay(), props.isRaining(), props.isThundering(),
                 props.getClearWeatherTime(), props.getRainTime(), props.getThunderTime(), inventory
         ));
@@ -100,14 +101,6 @@ public class HistoryManager {
         return h == null ? 0 : h.size();
     }
 
-    public static void truncateHistoryTo(UUID id, int keep) {
-        Deque<TimeSnapshot> h = PLAYER_HISTORY.get(id);
-        if (h == null) return;
-        List<TimeSnapshot> list = new ArrayList<>(h);
-        h.clear();
-        for (int i = 0; i < Math.min(keep, list.size()); i++) h.addLast(list.get(i));
-    }
-
     public static void clearPlayerHistory(UUID id) {
         PLAYER_HISTORY.remove(id); BLOCK_HISTORY.remove(id); BLOCK_UNDO_STACK.remove(id); PAUSED_PLAYERS.remove(id);
     }
@@ -147,18 +140,14 @@ public class HistoryManager {
         }
     }
 
-    /** Capture chaque entite non-joueur: animaux, monstres, objets, projectiles, XP, etc. */
     public static void recordEntitySnapshot(Entity entity) {
-        if (entity instanceof PlayerEntity || entity.isRemoved()) return;
+        if (entity instanceof PlayerEntity || entity.isRemoved() || !PAUSED_PLAYERS.isEmpty()) return;
         NbtCompound nbt = new NbtCompound();
         entity.writeNbt(nbt);
         EntitySnapshot snapshot = new EntitySnapshot(
-                currentTick,
-                entity.getUuid(),
+                currentTick, entity.getUuid(),
                 Registries.ENTITY_TYPE.getId(entity.getType()).toString(),
-                entity.getWorld().getRegistryKey().getValue().toString(),
-                nbt.copy()
-        );
+                entity.getWorld().getRegistryKey().getValue().toString(), nbt.copy());
         synchronized (ENTITY_HISTORY) {
             ENTITY_HISTORY.addLast(snapshot);
             int max = Math.max(20000, ChronosConfig.getBufferTicks() * 64);
@@ -176,8 +165,7 @@ public class HistoryManager {
                 if (s.tick() < minTick || s.tick() > maxTick) continue;
                 long diff = Math.abs(s.tick() - targetTick);
                 if (!bestDiff.containsKey(s.entityUuid()) || diff < bestDiff.get(s.entityUuid())) {
-                    bestDiff.put(s.entityUuid(), diff);
-                    best.put(s.entityUuid(), s);
+                    bestDiff.put(s.entityUuid(), diff); best.put(s.entityUuid(), s);
                 }
             }
             return new ArrayList<>(best.values());
