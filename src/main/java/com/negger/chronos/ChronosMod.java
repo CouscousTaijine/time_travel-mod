@@ -21,6 +21,8 @@ import net.fabricmc.fabric.api.itemgroup.v1.ItemGroupEvents;
 import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.block.Blocks;
 import net.minecraft.entity.LivingEntity;
+import net.minecraft.entity.effect.StatusEffectInstance;
+import net.minecraft.entity.effect.StatusEffects;
 import net.minecraft.entity.player.PlayerEntity;
 import net.minecraft.item.Item;
 import net.minecraft.item.ItemGroups;
@@ -35,6 +37,7 @@ import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.server.world.ServerWorld;
 import net.minecraft.sound.SoundCategory;
 import net.minecraft.sound.SoundEvents;
+import net.minecraft.text.Text;
 import net.minecraft.util.ActionResult;
 import net.minecraft.util.Identifier;
 import net.minecraft.util.WorldSavePath;
@@ -62,7 +65,6 @@ public class ChronosMod implements ModInitializer {
     );
 
     private static final Map<UUID, ReturnPosition> PORTAL_RETURN_POSITIONS = new HashMap<>();
-    private static final Map<UUID, Boolean> PORTAL_WORLD_PREPARED = new HashMap<>();
 
     @Override
     public void onInitialize() {
@@ -198,7 +200,6 @@ public class ChronosMod implements ModInitializer {
             RewindManager.clear(handler.player.getUuid());
             HistoryManager.clearPlayerHistory(handler.player.getUuid());
             PORTAL_RETURN_POSITIONS.remove(handler.player.getUuid());
-            PORTAL_WORLD_PREPARED.remove(handler.player.getUuid());
         });
     }
 
@@ -223,6 +224,30 @@ public class ChronosMod implements ModInitializer {
         return pos == null ? player.getZ() : pos.z;
     }
 
+    /** Short visual/audio transition used by both entry and exit. */
+    public static void playPortalTransition(ServerPlayerEntity player, ServerWorld destination, BlockPos destinationPos, boolean entering) {
+        player.swingHand(net.minecraft.util.Hand.MAIN_HAND, true);
+        player.addStatusEffect(new StatusEffectInstance(StatusEffects.DARKNESS, 8, 0, false, false, false));
+        player.playSound(SoundEvents.BLOCK_PORTAL_TRAVEL, 1.0f, entering ? 1.15f : 0.9f);
+        destination.spawnParticles(
+                ParticleTypes.PORTAL,
+                destinationPos.getX() + 0.5,
+                destinationPos.getY() + 1.0,
+                destinationPos.getZ() + 0.5,
+                120,
+                1.0, 1.0, 1.0,
+                0.18
+        );
+        destination.playSound(
+                null,
+                destinationPos,
+                SoundEvents.BLOCK_PORTAL_TRAVEL,
+                SoundCategory.PLAYERS,
+                0.9f,
+                entering ? 1.15f : 0.9f
+        );
+    }
+
     public static void returnFromPortalVoid(ServerPlayerEntity player) {
         ServerWorld overworld = player.getServer().getOverworld();
         ReturnPosition pos = PORTAL_RETURN_POSITIONS.get(player.getUuid());
@@ -232,12 +257,24 @@ public class ChronosMod implements ModInitializer {
         float yaw = pos == null ? player.getYaw() : pos.yaw;
         float pitch = pos == null ? player.getPitch() : pos.pitch;
 
+        playPortalTransition(player, overworld, new BlockPos((int) x, (int) y, (int) z), false);
         player.teleport(overworld, x, y, z, yaw, pitch);
-        player.playSound(SoundEvents.BLOCK_PORTAL_TRAVEL, 0.8f, 0.9f);
     }
 
+    /**
+     * Creates the starter island only once. The initialized flag is stored in
+     * the pocket world's PersistentState, so the world itself remains persistent:
+     * blocks, containers, mobs, dropped items and other normal world data survive
+     * leaving the dimension and restarting the server.
+     */
     public static void preparePortalWorld(ServerWorld world) {
-        if (!PORTAL_WORLD_PREPARED.isEmpty()) {
+        PortalWorldState state = world.getPersistentStateManager().getOrCreate(
+                PortalWorldState::fromNbt,
+                PortalWorldState::new,
+                MOD_ID + "_dimension_portal"
+        );
+
+        if (state.isInitialized()) {
             return;
         }
 
@@ -250,7 +287,6 @@ public class ChronosMod implements ModInitializer {
             }
         }
 
-        // Petit arbre central, volontairement compact pour tenir sur l'île 5x5.
         for (int y = 2; y <= 5; y++) {
             world.setBlockState(center.add(0, y, 0), Blocks.OAK_LOG.getDefaultState(), 3);
         }
@@ -270,6 +306,8 @@ public class ChronosMod implements ModInitializer {
                 }
             }
         }
+
+        state.setInitialized();
     }
 
     public static void spawnPortalParticles(ServerWorld world, BlockPos pos) {
