@@ -15,28 +15,10 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 
-/**
- * Sauvegarde l'historique "longue durée" (1 point par seconde) d'un joueur
- * sur le disque, dans le dossier de sauvegarde du monde : world/chronos/<uuid>.dat
- *
- * Format : un NbtCompound compressé en Gzip (comme n'importe quelle sauvegarde
- * Minecraft) contenant un unique tableau d'octets où chaque entrée est encodée
- * en binaire compact à taille fixe (40 octets/entrée). Beaucoup plus léger
- * qu'une liste NBT classique (qui répète les noms de champs à chaque entrée).
- */
 public class PersistenceIO {
 
-    private static final int RECORD_SIZE = 40; // 8+4+4+4+4+4+4+4+4 octets
+    private static final int RECORD_SIZE = 48;
 
-    /**
-     * Le compteur de tick interne repart de zéro à chaque redémarrage du
-     * serveur. Sans ça, un vieux tick (ex: 5 000 000, d'il y a 3 jours) et un
-     * nouveau tick (qui recommence à 0) rentreraient en collision et tout
-     * l'ordre chronologique du rewind casserait. On sauvegarde donc une
-     * petite "ancre" (dernier tick connu + horodatage réel) pour que le
-     * compteur reparte au bon endroit après un redémarrage, en tenant compte
-     * du temps réel écoulé (même serveur éteint).
-     */
     public record ClockAnchor(long tick, long epochMillis) {}
 
     public static void saveMeta(Path chronosDir, long lastTick) {
@@ -65,28 +47,26 @@ public class PersistenceIO {
 
     public static void save(Path chronosDir, UUID uuid, List<TimeSnapshot> longTerm) {
         if (longTerm.isEmpty()) return;
-
         try {
             Files.createDirectories(chronosDir);
             java.io.File file = chronosDir.resolve(uuid + ".dat").toFile();
-
             ByteArrayOutputStream baos = new ByteArrayOutputStream(longTerm.size() * RECORD_SIZE);
             try (DataOutputStream out = new DataOutputStream(baos)) {
                 for (TimeSnapshot s : longTerm) {
                     out.writeLong(s.tick());
-                    out.writeFloat((float) s.x());
-                    out.writeFloat((float) s.y());
-                    out.writeFloat((float) s.z());
+                    out.writeDouble(s.x());
+                    out.writeDouble(s.y());
+                    out.writeDouble(s.z());
                     out.writeFloat(s.yaw());
                     out.writeFloat(s.pitch());
                     out.writeFloat(s.health());
                     out.writeInt(s.foodLevel());
                     out.writeFloat(s.saturation());
+                    out.writeLong(s.worldTime());
                 }
             }
-
             NbtCompound root = new NbtCompound();
-            root.putInt("version", 1);
+            root.putInt("version", 2);
             root.putInt("count", longTerm.size());
             root.putByteArray("data", baos.toByteArray());
             NbtIo.writeCompressed(root, file);
@@ -99,24 +79,24 @@ public class PersistenceIO {
         List<TimeSnapshot> result = new ArrayList<>();
         java.io.File file = chronosDir.resolve(uuid + ".dat").toFile();
         if (!file.exists()) return result;
-
         try {
             NbtCompound root = NbtIo.readCompressed(file);
             int count = root.getInt("count");
             byte[] data = root.getByteArray("data");
-
+            int version = root.contains("version") ? root.getInt("version") : 1;
             try (DataInputStream in = new DataInputStream(new ByteArrayInputStream(data))) {
                 for (int i = 0; i < count; i++) {
                     long tick = in.readLong();
-                    double x = in.readFloat();
-                    double y = in.readFloat();
-                    double z = in.readFloat();
+                    double x = version >= 2 ? in.readDouble() : in.readFloat();
+                    double y = version >= 2 ? in.readDouble() : in.readFloat();
+                    double z = version >= 2 ? in.readDouble() : in.readFloat();
                     float yaw = in.readFloat();
                     float pitch = in.readFloat();
                     float health = in.readFloat();
                     int food = in.readInt();
                     float sat = in.readFloat();
-                    result.add(new TimeSnapshot(tick, x, y, z, yaw, pitch, health, food, sat));
+                    long worldTime = version >= 2 ? in.readLong() : 0L;
+                    result.add(new TimeSnapshot(tick, x, y, z, yaw, pitch, health, food, sat, worldTime));
                 }
             }
         } catch (IOException e) {
