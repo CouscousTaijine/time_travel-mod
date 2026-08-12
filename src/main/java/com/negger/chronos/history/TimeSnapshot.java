@@ -1,8 +1,7 @@
 package com.negger.chronos.history;
 
 /**
- * Un instantané de l'état d'un joueur à un tick précis.
- * Immuable, léger : c'est ce qui est stocké des milliers de fois en mémoire.
+ * Instantané d'un joueur et de l'horloge du monde à un tick précis.
  */
 public record TimeSnapshot(
         long tick,
@@ -10,6 +9,7 @@ public record TimeSnapshot(
         float yaw, float pitch,
         float health,
         int foodLevel,
-        float saturation
+        float saturation,
+        long worldTime
 ) {
 }
