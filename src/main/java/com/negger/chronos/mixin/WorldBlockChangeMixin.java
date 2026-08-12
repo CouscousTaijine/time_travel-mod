@@ -4,6 +4,7 @@ import com.negger.chronos.history.BlockChange;
 import com.negger.chronos.history.HistoryManager;
 import com.negger.chronos.rewind.RewindManager;
 import net.minecraft.block.BlockState;
+import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.server.world.ServerWorld;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.world.World;
@@ -21,16 +22,30 @@ public abstract class WorldBlockChangeMixin {
         if (RewindManager.isRestoring()) return;
         if (oldState.equals(newState)) return;
 
-        BlockChange.ChangeType type;
-        if (!oldState.isAir() && newState.isAir()) type = BlockChange.ChangeType.BREAK;
-        else type = BlockChange.ChangeType.PLACE;
+        // Le moteur actuel est organisé par historique de joueur. On associe
+        // les changements automatiques au joueur le plus proche afin que TNT,
+        // pistons, redstone et mobs soient inclus dans le même rewind.
+        ServerPlayerEntity owner = null;
+        double bestDistance = Double.MAX_VALUE;
+        for (ServerPlayerEntity player : serverWorld.getPlayers()) {
+            double distance = player.squaredDistanceTo(pos.getX() + 0.5, pos.getY() + 0.5, pos.getZ() + 0.5);
+            if (distance < bestDistance) {
+                bestDistance = distance;
+                owner = player;
+            }
+        }
+        if (owner == null) return;
 
-        HistoryManager.recordWorldBlockChange(serverWorld, new BlockChange(
+        BlockChange.ChangeType type = (!oldState.isAir() && newState.isAir())
+                ? BlockChange.ChangeType.BREAK
+                : BlockChange.ChangeType.PLACE;
+
+        HistoryManager.recordBlockChange(new BlockChange(
                 HistoryManager.getCurrentTick(),
                 pos.toImmutable(),
                 oldState,
                 newState,
-                null,
+                owner.getUuid(),
                 type
         ));
     }
