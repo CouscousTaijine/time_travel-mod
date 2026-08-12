@@ -2,11 +2,17 @@ package com.negger.chronos.history;
 
 import com.negger.chronos.ChronosConfig;
 import net.minecraft.entity.LivingEntity;
+import net.minecraft.nbt.NbtCompound;
+import net.minecraft.nbt.NbtList;
 import net.minecraft.server.network.ServerPlayerEntity;
+import net.minecraft.server.world.ServerWorld;
+import net.minecraft.registry.RegistryKey;
+import net.minecraft.world.World;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -20,6 +26,8 @@ public class HistoryManager {
     private static final Set<UUID> PAUSED_PLAYERS = new CopyOnWriteArraySet<>();
     private static final Map<UUID, Deque<BlockChange>> BLOCK_HISTORY = new ConcurrentHashMap<>();
     private static final Map<UUID, Deque<BlockChange>> BLOCK_UNDO_STACK = new ConcurrentHashMap<>();
+    private static final Map<RegistryKey<World>, Deque<BlockChange>> WORLD_BLOCK_HISTORY = new ConcurrentHashMap<>();
+    private static final Map<RegistryKey<World>, Deque<BlockChange>> WORLD_BLOCK_UNDO = new ConcurrentHashMap<>();
     private static final Deque<EntitySnapshot> ENTITY_HISTORY = new ArrayDeque<>();
     private static final Deque<DeathRecord> DEATH_RECORDS = new ArrayDeque<>();
     private static long currentTick = 0;
@@ -40,11 +48,19 @@ public class HistoryManager {
 
     public static void recordSnapshot(ServerPlayerEntity player) {
         if (isPaused(player.getUuid())) return;
+        ServerWorld world = player.getServerWorld();
+        var props = world.getLevelProperties();
+        NbtList inventory = player.getInventory().writeNbt(new NbtList());
+        NbtCompound inventoryNbt = new NbtCompound();
+        inventoryNbt.put("Items", inventory);
+        inventoryNbt.putInt("SelectedSlot", player.getInventory().selectedSlot);
+
         Deque<TimeSnapshot> history = PLAYER_HISTORY.computeIfAbsent(player.getUuid(), id -> new ArrayDeque<>());
         history.addLast(new TimeSnapshot(currentTick, player.getX(), player.getY(), player.getZ(),
                 player.getYaw(), player.getPitch(), player.getHealth(),
                 player.getHungerManager().getFoodLevel(), player.getHungerManager().getSaturationLevel(),
-                player.getServerWorld().getTime()));
+                props.getTime(), props.isRaining(), props.isThundering(),
+                props.getClearWeatherTime(), props.getRainTime(), props.getThunderTime(), inventoryNbt));
         int maxSize = ChronosConfig.getBufferTicks();
         while (history.size() > maxSize) history.pollFirst();
     }
@@ -57,10 +73,8 @@ public class HistoryManager {
     public static void recordLongTermIfDue(ServerPlayerEntity player) {
         if (!ChronosConfig.persistenceEnabled || isPaused(player.getUuid()) || currentTick % 20 != 0) return;
         Deque<TimeSnapshot> history = LONG_TERM_HISTORY.computeIfAbsent(player.getUuid(), id -> new ArrayDeque<>());
-        history.addLast(new TimeSnapshot(currentTick, player.getX(), player.getY(), player.getZ(),
-                player.getYaw(), player.getPitch(), player.getHealth(),
-                player.getHungerManager().getFoodLevel(), player.getHungerManager().getSaturationLevel(),
-                player.getServerWorld().getTime()));
+        TimeSnapshot s = snapshotHistory(player.getUuid()).isEmpty() ? null : snapshotHistory(player.getUuid()).get(snapshotHistory(player.getUuid()).size() - 1);
+        if (s != null) history.addLast(s);
         long maxSize = ChronosConfig.getPersistCapacity();
         while (history.size() > maxSize) history.pollFirst();
     }
@@ -111,6 +125,42 @@ public class HistoryManager {
         if (undo != null) undo.clear();
     }
 
+    /** Capture tous les changements de blocs, quelle que soit leur cause: joueur, TNT, mob, piston, redstone, etc. */
+    public static void recordWorldBlockChange(ServerWorld world, BlockChange change) {
+        Deque<BlockChange> history = WORLD_BLOCK_HISTORY.computeIfAbsent(world.getRegistryKey(), id -> new ArrayDeque<>());
+        synchronized (history) {
+            history.addLast(change);
+            int maxSize = Math.max(ChronosConfig.getBufferTicks() * 8, 4000);
+            while (history.size() > maxSize) history.pollFirst();
+        }
+        Deque<BlockChange> undo = WORLD_BLOCK_UNDO.get(world.getRegistryKey());
+        if (undo != null) undo.clear();
+    }
+
+    public static BlockChange popMatchingWorldBlockChange(ServerWorld world, long minTick) {
+        Deque<BlockChange> history = WORLD_BLOCK_HISTORY.get(world.getRegistryKey());
+        if (history == null) return null;
+        synchronized (history) {
+            BlockChange last = history.peekLast();
+            if (last == null || last.tick() < minTick) return null;
+            history.pollLast();
+            WORLD_BLOCK_UNDO.computeIfAbsent(world.getRegistryKey(), id -> new ArrayDeque<>()).addLast(last);
+            return last;
+        }
+    }
+
+    public static BlockChange redoWorldBlockChange(ServerWorld world, long maxTick) {
+        Deque<BlockChange> undo = WORLD_BLOCK_UNDO.get(world.getRegistryKey());
+        if (undo == null) return null;
+        synchronized (undo) {
+            BlockChange last = undo.peekLast();
+            if (last == null || last.tick() > maxTick) return null;
+            undo.pollLast();
+            WORLD_BLOCK_HISTORY.computeIfAbsent(world.getRegistryKey(), id -> new ArrayDeque<>()).addLast(last);
+            return last;
+        }
+    }
+
     public static BlockChange popMatchingBlockChange(UUID playerUuid, long minTick) {
         Deque<BlockChange> history = BLOCK_HISTORY.get(playerUuid);
         if (history == null) return null;
@@ -153,8 +203,8 @@ public class HistoryManager {
 
     public static List<EntitySnapshot> getEntitySnapshotsNear(long targetTick, long minTick, long maxTick) {
         synchronized (ENTITY_HISTORY) {
-            Map<UUID, EntitySnapshot> best = new java.util.HashMap<>();
-            Map<UUID, Long> bestDiff = new java.util.HashMap<>();
+            Map<UUID, EntitySnapshot> best = new HashMap<>();
+            Map<UUID, Long> bestDiff = new HashMap<>();
             for (EntitySnapshot s : ENTITY_HISTORY) {
                 if (s.tick() < minTick || s.tick() > maxTick) continue;
                 long diff = Math.abs(s.tick() - targetTick);
