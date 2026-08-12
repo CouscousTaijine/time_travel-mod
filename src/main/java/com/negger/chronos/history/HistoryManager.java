@@ -50,19 +50,13 @@ public class HistoryManager {
         player.writeNbt(full);
         NbtCompound inventory = new NbtCompound();
         if (full.contains("Inventory")) inventory.put("Inventory", full.getList("Inventory", 10).copy());
-
         var props = world.getLevelProperties();
         Deque<TimeSnapshot> history = PLAYER_HISTORY.computeIfAbsent(player.getUuid(), id -> new ArrayDeque<>());
-        history.addLast(new TimeSnapshot(
-                currentTick, player.getX(), player.getY(), player.getZ(), player.getYaw(), player.getPitch(),
+        history.addLast(new TimeSnapshot(currentTick, player.getX(), player.getY(), player.getZ(), player.getYaw(), player.getPitch(),
                 player.getHealth(), player.getHungerManager().getFoodLevel(), player.getHungerManager().getSaturationLevel(),
-                player.experienceLevel, player.totalExperience, player.experienceProgress,
-                player.getInventory().selectedSlot,
-                props.getTimeOfDay(), props.isRaining(), props.isThundering(),
-                props.getClearWeatherTime(), props.getRainTime(), props.getThunderTime(), inventory
-        ));
-        int max = ChronosConfig.getBufferTicks();
-        while (history.size() > max) history.pollFirst();
+                player.experienceLevel, player.totalExperience, player.experienceProgress, player.getInventory().selectedSlot,
+                props.getTimeOfDay(), props.isRaining(), props.isThundering(), props.getClearWeatherTime(), props.getRainTime(), props.getThunderTime(), inventory));
+        while (history.size() > ChronosConfig.getBufferTicks()) history.pollFirst();
     }
 
     public static List<TimeSnapshot> snapshotHistory(UUID id) {
@@ -99,6 +93,15 @@ public class HistoryManager {
     public static int getPlayerHistorySize(UUID id) {
         Deque<TimeSnapshot> h = PLAYER_HISTORY.get(id);
         return h == null ? 0 : h.size();
+    }
+
+    /** Coupe la branche future quand le joueur relâche l'item dans le passé. */
+    public static void truncateHistoryTo(UUID id, int keepCount) {
+        Deque<TimeSnapshot> h = PLAYER_HISTORY.get(id);
+        if (h == null) return;
+        List<TimeSnapshot> list = new ArrayList<>(h);
+        h.clear();
+        for (int i = 0; i < Math.min(keepCount, list.size()); i++) h.addLast(list.get(i));
     }
 
     public static void clearPlayerHistory(UUID id) {
@@ -144,9 +147,7 @@ public class HistoryManager {
         if (entity instanceof PlayerEntity || entity.isRemoved() || !PAUSED_PLAYERS.isEmpty()) return;
         NbtCompound nbt = new NbtCompound();
         entity.writeNbt(nbt);
-        EntitySnapshot snapshot = new EntitySnapshot(
-                currentTick, entity.getUuid(),
-                Registries.ENTITY_TYPE.getId(entity.getType()).toString(),
+        EntitySnapshot snapshot = new EntitySnapshot(currentTick, entity.getUuid(), Registries.ENTITY_TYPE.getId(entity.getType()).toString(),
                 entity.getWorld().getRegistryKey().getValue().toString(), nbt.copy());
         synchronized (ENTITY_HISTORY) {
             ENTITY_HISTORY.addLast(snapshot);
