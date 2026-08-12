@@ -11,11 +11,14 @@ import net.minecraft.entity.EntityType;
 import net.minecraft.entity.LivingEntity;
 import net.minecraft.item.ItemStack;
 import net.minecraft.nbt.NbtCompound;
+import net.minecraft.nbt.NbtList;
 import net.minecraft.particle.ParticleTypes;
 import net.minecraft.server.network.ServerPlayerEntity;
+import net.minecraft.server.world.ServerWorld;
 import net.minecraft.sound.SoundCategory;
 import net.minecraft.sound.SoundEvents;
 import net.minecraft.text.Text;
+import net.minecraft.world.level.ServerWorldProperties;
 
 import java.util.List;
 import java.util.Map;
@@ -44,8 +47,10 @@ public class RewindManager {
     private static final Map<UUID, TimeSnapshot> SAVEPOINTS = new ConcurrentHashMap<>();
     private static final Map<UUID, PendingPress> PENDING = new ConcurrentHashMap<>();
     private static net.minecraft.server.MinecraftServer CURRENT_SERVER;
+    private static volatile boolean restoring = false;
 
     public static void setServer(net.minecraft.server.MinecraftServer server) { CURRENT_SERVER = server; }
+    public static boolean isRestoring() { return restoring; }
 
     public static boolean onRightClickPress(ServerPlayerEntity player) {
         UUID id = player.getUuid();
@@ -141,12 +146,8 @@ public class RewindManager {
             player.sendMessage(Text.literal("§7Tu es déjà au présent."), true);
             return;
         }
-
         session.mode = Mode.AUTO_FORWARD;
         session.targetCursor = session.buffer.size() - 1;
-
-        // Rejoue toute la branche temporelle dans le même tick serveur.
-        // Aucun déplacement visuel intermédiaire et aucun effet de timelapse.
         while (SESSIONS.containsKey(player.getUuid()) && session.mode == Mode.AUTO_FORWARD) {
             if (!advanceOneStep(player, session, true)) break;
         }
@@ -157,9 +158,17 @@ public class RewindManager {
         Session session = SESSIONS.get(id);
         TimeSnapshot current;
         if (session != null) current = session.buffer.get(session.cursor);
-        else current = new TimeSnapshot(HistoryManager.getCurrentTick(), player.getX(), player.getY(), player.getZ(),
-                player.getYaw(), player.getPitch(), player.getHealth(), player.getHungerManager().getFoodLevel(),
-                player.getHungerManager().getSaturationLevel(), player.getServerWorld().getTimeOfDay());
+        else {
+            ServerWorld world = player.getServerWorld();
+            ServerWorldProperties props = (ServerWorldProperties) world.getLevelProperties();
+            NbtCompound inv = new NbtCompound();
+            inv.put("Items", player.getInventory().writeNbt(new NbtList()));
+            inv.putInt("SelectedSlot", player.getInventory().selectedSlot);
+            current = new TimeSnapshot(HistoryManager.getCurrentTick(), player.getX(), player.getY(), player.getZ(),
+                    player.getYaw(), player.getPitch(), player.getHealth(), player.getHungerManager().getFoodLevel(),
+                    player.getHungerManager().getSaturationLevel(), props.getTime(), props.isRaining(), props.isThundering(),
+                    props.getClearWeatherTime(), props.getRainTime(), props.getThunderTime(), inv);
+        }
         SAVEPOINTS.put(id, current);
         player.getServerWorld().playSound(null, player.getX(), player.getY(), player.getZ(), SoundEvents.BLOCK_BEACON_ACTIVATE,
                 SoundCategory.PLAYERS, 0.5f, 1.8f);
@@ -175,9 +184,7 @@ public class RewindManager {
         return best;
     }
 
-    private static boolean advanceOneStep(ServerPlayerEntity player, Session session) {
-        return advanceOneStep(player, session, false);
-    }
+    private static boolean advanceOneStep(ServerPlayerEntity player, Session session) { return advanceOneStep(player, session, false); }
 
     private static boolean advanceOneStep(ServerPlayerEntity player, Session session, boolean instant) {
         boolean backward = switch (session.mode) {
@@ -195,12 +202,17 @@ public class RewindManager {
         long oldTick = session.buffer.get(session.cursor).tick();
         long newTick = session.buffer.get(newCursor).tick();
 
-        if (backward) revertBlocksAndEntities(player, newTick, oldTick);
-        else replayBlocks(player, newTick);
+        restoring = true;
+        try {
+            if (backward) revertBlocksAndEntities(player, newTick, oldTick);
+            else replayBlocks(player, newTick);
+            restoreEntityPositions(newTick);
+            session.cursor = newCursor;
+            applySnapshot(player, session.buffer.get(newCursor));
+        } finally {
+            restoring = false;
+        }
 
-        restoreEntityPositions(newTick);
-        session.cursor = newCursor;
-        applySnapshot(player, session.buffer.get(newCursor));
         if (!instant) playFeedback(player, backward);
 
         boolean reachedTarget = session.mode == Mode.AUTO_TO_TARGET && session.cursor == session.targetCursor;
@@ -216,8 +228,7 @@ public class RewindManager {
     }
 
     private static void finishSession(ServerPlayerEntity player, Session session) {
-        boolean backToPresent = session.mode == Mode.AUTO_FORWARD
-                || (session.mode == Mode.AUTO_TO_TARGET && session.cursor >= session.buffer.size() - 1);
+        boolean backToPresent = session.mode == Mode.AUTO_FORWARD || (session.mode == Mode.AUTO_TO_TARGET && session.cursor >= session.buffer.size() - 1);
         if (backToPresent) {
             SESSIONS.remove(player.getUuid());
             HistoryManager.setPaused(player.getUuid(), false);
@@ -229,12 +240,37 @@ public class RewindManager {
     }
 
     private static void applySnapshot(ServerPlayerEntity player, TimeSnapshot snapshot) {
-        player.teleport(player.getServerWorld(), snapshot.x(), snapshot.y(), snapshot.z(), snapshot.yaw(), snapshot.pitch());
-        player.getServerWorld().setTimeOfDay(snapshot.worldTime());
+        ServerWorld world = player.getServerWorld();
+        ServerWorldProperties props = (ServerWorldProperties) world.getLevelProperties();
+
+        player.teleport(world, snapshot.x(), snapshot.y(), snapshot.z(), snapshot.yaw(), snapshot.pitch());
+
+        // Restaurer le temps complet, pas seulement l'heure affichée.
+        props.setTime(snapshot.worldTime());
+        world.setTimeOfDay(snapshot.worldTime() % 24000L);
+
+        // Restaurer l'état exact de météo et ses compteurs, pour éviter que
+        // la pluie/orage reparte immédiatement après un rewind.
+        props.setRaining(snapshot.raining());
+        props.setThundering(snapshot.thundering());
+        props.setClearWeatherTime(snapshot.clearWeatherTime());
+        props.setRainTime(snapshot.rainTime());
+        props.setThunderTime(snapshot.thunderTime());
+
         if (ChronosConfig.restoreHealthAndHunger) {
             player.setHealth(Math.max(0.1f, snapshot.health()));
             player.getHungerManager().setFoodLevel(snapshot.foodLevel());
             player.getHungerManager().setSaturationLevel(snapshot.saturation());
+        }
+
+        // L'inventaire est restauré depuis le snapshot, ce qui fait revenir
+        // les items que le joueur avait jetés, utilisés ou déplacés après ce tick.
+        if (snapshot.inventoryNbt() != null) {
+            NbtCompound inv = snapshot.inventoryNbt();
+            player.getInventory().readNbt(inv.getList("Items", 10));
+            player.getInventory().selectedSlot = Math.max(0, Math.min(8, inv.getInt("SelectedSlot")));
+            player.getInventory().markDirty();
+            player.playerScreenHandler.sendContentUpdates();
         }
     }
 
@@ -258,11 +294,8 @@ public class RewindManager {
         if (type.isEmpty()) return;
         Entity entity = type.get().create(player.getServerWorld());
         if (entity == null) return;
-
         NbtCompound nbt = death.nbt().copy();
         nbt.remove("UUID");
-        // AFTER_DEATH capture contient Health=0 et DeathTime>0. Ces valeurs
-        // provoquent la mort immédiate de l'entité nouvellement recréée.
         nbt.remove("Health");
         nbt.remove("DeathTime");
         nbt.remove("HurtTime");
@@ -291,10 +324,14 @@ public class RewindManager {
     }
 
     private static void giveOrTakeItemForRevert(ServerPlayerEntity player, BlockChange change) {
+        // Inventory snapshots are authoritative. These helpers are retained
+        // for compatibility with older block history records only.
+        if (change.playerUuid() == null) return;
         if (change.type() == BlockChange.ChangeType.BREAK) removeOneMatchingItem(player, change.oldState().getBlock().asItem());
         else if (change.type() == BlockChange.ChangeType.PLACE) giveItem(player, change.newState().getBlock().asItem());
     }
     private static void giveOrTakeItemForReplay(ServerPlayerEntity player, BlockChange change) {
+        if (change.playerUuid() == null) return;
         if (change.type() == BlockChange.ChangeType.BREAK) giveItem(player, change.oldState().getBlock().asItem());
         else if (change.type() == BlockChange.ChangeType.PLACE) removeOneMatchingItem(player, change.newState().getBlock().asItem());
     }
@@ -325,12 +362,16 @@ public class RewindManager {
     public static int revertInstantTo(ServerPlayerEntity player, long targetTick) {
         int count = 0;
         BlockChange change;
-        while ((change = HistoryManager.popMatchingBlockChange(player.getUuid(), targetTick + 1)) != null) {
-            player.getServerWorld().setBlockState(change.pos(), change.oldState());
-            giveOrTakeItemForRevert(player, change);
-            count++;
+        restoring = true;
+        try {
+            while ((change = HistoryManager.popMatchingBlockChange(player.getUuid(), targetTick + 1)) != null) {
+                player.getServerWorld().setBlockState(change.pos(), change.oldState());
+                count++;
+            }
+            for (DeathRecord death : HistoryManager.popDeathsBetween(targetTick + 1, HistoryManager.getCurrentTick())) reviveEntity(player, death);
+        } finally {
+            restoring = false;
         }
-        for (DeathRecord death : HistoryManager.popDeathsBetween(targetTick + 1, HistoryManager.getCurrentTick())) reviveEntity(player, death);
         return count;
     }
 
