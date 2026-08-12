@@ -2,7 +2,7 @@ package com.negger.chronos.history;
 
 import net.minecraft.nbt.NbtCompound;
 
-/** Snapshot joueur + inventaire + selection + horloge/meteo du monde. */
+/** Etat complet utile au rewind d'un joueur + horloge/meteo du monde. */
 public record TimeSnapshot(
         long tick,
         double x, double y, double z,
@@ -10,10 +10,6 @@ public record TimeSnapshot(
         float health,
         int foodLevel,
         float saturation,
-        int experienceLevel,
-        int totalExperience,
-        float experienceProgress,
-        int selectedSlot,
         long worldTime,
         boolean raining,
         boolean thundering,
@@ -24,7 +20,7 @@ public record TimeSnapshot(
 ) {
     public TimeSnapshot(long tick, double x, double y, double z, float yaw, float pitch,
                         float health, int foodLevel, float saturation, long worldTime) {
-        this(tick, x, y, z, yaw, pitch, health, foodLevel, saturation,
-                0, 0, 0.0f, 0, worldTime, false, false, 0, 0, 0, null);
+        this(tick, x, y, z, yaw, pitch, health, foodLevel, saturation, worldTime,
+                false, false, 0, 0, 0, null);
     }
 }

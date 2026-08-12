@@ -1,19 +1,12 @@
 package com.negger.chronos.history;
 
 import com.negger.chronos.ChronosConfig;
-import net.minecraft.entity.Entity;
 import net.minecraft.entity.LivingEntity;
-import net.minecraft.entity.player.PlayerEntity;
-import net.minecraft.nbt.NbtCompound;
 import net.minecraft.server.network.ServerPlayerEntity;
-import net.minecraft.server.world.ServerWorld;
-import net.minecraft.registry.Registries;
-import net.minecraft.world.level.ServerWorldProperties;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -33,84 +26,160 @@ public class HistoryManager {
 
     public static void tick() { currentTick++; }
     public static long getCurrentTick() { return currentTick; }
+
     public static void initializeClockFromAnchor(long anchorTick, long anchorEpochMillis) {
-        currentTick = anchorTick + Math.max(0, Math.round((System.currentTimeMillis() - anchorEpochMillis) / 50.0));
+        long elapsedMillis = System.currentTimeMillis() - anchorEpochMillis;
+        long elapsedTicks = Math.max(0, Math.round(elapsedMillis / 50.0));
+        currentTick = anchorTick + elapsedTicks;
     }
-    public static void setPaused(UUID id, boolean paused) { if (paused) PAUSED_PLAYERS.add(id); else PAUSED_PLAYERS.remove(id); }
-    public static boolean isPaused(UUID id) { return PAUSED_PLAYERS.contains(id); }
+
+    public static void setPaused(UUID playerUuid, boolean paused) {
+        if (paused) PAUSED_PLAYERS.add(playerUuid); else PAUSED_PLAYERS.remove(playerUuid);
+    }
+    public static boolean isPaused(UUID playerUuid) { return PAUSED_PLAYERS.contains(playerUuid); }
 
     public static void recordSnapshot(ServerPlayerEntity player) {
         if (isPaused(player.getUuid())) return;
-        ServerWorld world = player.getServerWorld();
-        NbtCompound full = new NbtCompound(); player.writeNbt(full);
-        NbtCompound inventory = new NbtCompound();
-        if (full.contains("Inventory")) inventory.put("Inventory", full.getList("Inventory", 10).copy());
-        ServerWorldProperties props = (ServerWorldProperties) world.getLevelProperties();
         Deque<TimeSnapshot> history = PLAYER_HISTORY.computeIfAbsent(player.getUuid(), id -> new ArrayDeque<>());
-        history.addLast(new TimeSnapshot(currentTick, player.getX(), player.getY(), player.getZ(), player.getYaw(), player.getPitch(),
-                player.getHealth(), player.getHungerManager().getFoodLevel(), player.getHungerManager().getSaturationLevel(),
-                player.experienceLevel, player.totalExperience, player.experienceProgress, player.getInventory().selectedSlot,
-                props.getTimeOfDay(), props.isRaining(), props.isThundering(), props.getClearWeatherTime(), props.getRainTime(), props.getThunderTime(), inventory));
-        while (history.size() > ChronosConfig.getBufferTicks()) history.pollFirst();
+        history.addLast(new TimeSnapshot(currentTick, player.getX(), player.getY(), player.getZ(),
+                player.getYaw(), player.getPitch(), player.getHealth(),
+                player.getHungerManager().getFoodLevel(), player.getHungerManager().getSaturationLevel(),
+                player.getServerWorld().getTime()));
+        int maxSize = ChronosConfig.getBufferTicks();
+        while (history.size() > maxSize) history.pollFirst();
     }
 
-    public static List<TimeSnapshot> snapshotHistory(UUID id) { Deque<TimeSnapshot> h = PLAYER_HISTORY.get(id); return h == null ? new ArrayList<>() : new ArrayList<>(h); }
+    public static List<TimeSnapshot> snapshotHistory(UUID playerUuid) {
+        Deque<TimeSnapshot> history = PLAYER_HISTORY.get(playerUuid);
+        return history == null ? new ArrayList<>() : new ArrayList<>(history);
+    }
+
     public static void recordLongTermIfDue(ServerPlayerEntity player) {
         if (!ChronosConfig.persistenceEnabled || isPaused(player.getUuid()) || currentTick % 20 != 0) return;
-        Deque<TimeSnapshot> h = LONG_TERM_HISTORY.computeIfAbsent(player.getUuid(), id -> new ArrayDeque<>());
-        List<TimeSnapshot> shortHistory = snapshotHistory(player.getUuid()); if (shortHistory.isEmpty()) return;
-        h.addLast(shortHistory.get(shortHistory.size() - 1)); while (h.size() > ChronosConfig.getPersistCapacity()) h.pollFirst();
+        Deque<TimeSnapshot> history = LONG_TERM_HISTORY.computeIfAbsent(player.getUuid(), id -> new ArrayDeque<>());
+        history.addLast(new TimeSnapshot(currentTick, player.getX(), player.getY(), player.getZ(),
+                player.getYaw(), player.getPitch(), player.getHealth(),
+                player.getHungerManager().getFoodLevel(), player.getHungerManager().getSaturationLevel(),
+                player.getServerWorld().getTime()));
+        long maxSize = ChronosConfig.getPersistCapacity();
+        while (history.size() > maxSize) history.pollFirst();
     }
-    public static List<TimeSnapshot> getLongTermHistory(UUID id) { Deque<TimeSnapshot> h = LONG_TERM_HISTORY.get(id); return h == null ? new ArrayList<>() : new ArrayList<>(h); }
-    public static void setLongTermHistory(UUID id, List<TimeSnapshot> loaded) { LONG_TERM_HISTORY.put(id, new ArrayDeque<>(loaded)); }
-    public static List<TimeSnapshot> combinedHistory(UUID id) {
-        List<TimeSnapshot> shortTerm = snapshotHistory(id), longTerm = getLongTermHistory(id); if (shortTerm.isEmpty()) return longTerm;
-        long cutoff = shortTerm.get(0).tick(); List<TimeSnapshot> result = new ArrayList<>();
-        for (TimeSnapshot s : longTerm) if (s.tick() < cutoff) result.add(s); result.addAll(shortTerm); return result;
+
+    public static List<TimeSnapshot> getLongTermHistory(UUID playerUuid) {
+        Deque<TimeSnapshot> history = LONG_TERM_HISTORY.get(playerUuid);
+        return history == null ? new ArrayList<>() : new ArrayList<>(history);
     }
-    public static int getPlayerHistorySize(UUID id) { Deque<TimeSnapshot> h = PLAYER_HISTORY.get(id); return h == null ? 0 : h.size(); }
-    public static void truncateHistoryTo(UUID id, int keepCount) {
-        Deque<TimeSnapshot> h = PLAYER_HISTORY.get(id); if (h == null) return; List<TimeSnapshot> list = new ArrayList<>(h); h.clear();
-        for (int i = 0; i < Math.min(keepCount, list.size()); i++) h.addLast(list.get(i));
+    public static void setLongTermHistory(UUID playerUuid, List<TimeSnapshot> loaded) { LONG_TERM_HISTORY.put(playerUuid, new ArrayDeque<>(loaded)); }
+
+    public static List<TimeSnapshot> combinedHistory(UUID playerUuid) {
+        List<TimeSnapshot> shortTerm = snapshotHistory(playerUuid);
+        List<TimeSnapshot> longTerm = getLongTermHistory(playerUuid);
+        if (shortTerm.isEmpty()) return longTerm;
+        long cutoff = shortTerm.get(0).tick();
+        List<TimeSnapshot> combined = new ArrayList<>();
+        for (TimeSnapshot s : longTerm) if (s.tick() < cutoff) combined.add(s);
+        combined.addAll(shortTerm);
+        return combined;
     }
-    public static void clearPlayerHistory(UUID id) { PLAYER_HISTORY.remove(id); BLOCK_HISTORY.remove(id); BLOCK_UNDO_STACK.remove(id); PAUSED_PLAYERS.remove(id); }
-    public static void unloadLongTermFromMemory(UUID id) { LONG_TERM_HISTORY.remove(id); }
+
+    public static int getPlayerHistorySize(UUID playerUuid) {
+        Deque<TimeSnapshot> history = PLAYER_HISTORY.get(playerUuid);
+        return history == null ? 0 : history.size();
+    }
+
+    public static void truncateHistoryTo(UUID playerUuid, int keepFromStart) {
+        Deque<TimeSnapshot> history = PLAYER_HISTORY.get(playerUuid);
+        if (history == null) return;
+        List<TimeSnapshot> asList = new ArrayList<>(history);
+        history.clear();
+        for (int i = 0; i < Math.min(keepFromStart, asList.size()); i++) history.addLast(asList.get(i));
+    }
+
+    public static void clearPlayerHistory(UUID playerUuid) {
+        PLAYER_HISTORY.remove(playerUuid); BLOCK_HISTORY.remove(playerUuid); BLOCK_UNDO_STACK.remove(playerUuid); PAUSED_PLAYERS.remove(playerUuid);
+    }
+    public static void unloadLongTermFromMemory(UUID playerUuid) { LONG_TERM_HISTORY.remove(playerUuid); }
 
     public static void recordBlockChange(BlockChange change) {
-        Deque<BlockChange> h = BLOCK_HISTORY.computeIfAbsent(change.playerUuid(), id -> new ArrayDeque<>());
-        synchronized (h) { h.addLast(change); while (h.size() > ChronosConfig.getBufferTicks()) h.pollFirst(); }
-        Deque<BlockChange> undo = BLOCK_UNDO_STACK.get(change.playerUuid()); if (undo != null) undo.clear();
-    }
-    public static BlockChange popMatchingBlockChange(UUID id, long minTick) {
-        Deque<BlockChange> h = BLOCK_HISTORY.get(id); if (h == null) return null;
-        synchronized (h) { BlockChange c = h.peekLast(); if (c == null || c.tick() < minTick) return null; h.pollLast(); BLOCK_UNDO_STACK.computeIfAbsent(id, x -> new ArrayDeque<>()).addLast(c); return c; }
-    }
-    public static BlockChange redoMatchingBlockChange(UUID id, long maxTick) {
-        Deque<BlockChange> undo = BLOCK_UNDO_STACK.get(id); if (undo == null) return null;
-        synchronized (undo) { BlockChange c = undo.peekLast(); if (c == null || c.tick() > maxTick) return null; undo.pollLast(); BLOCK_HISTORY.computeIfAbsent(id, x -> new ArrayDeque<>()).addLast(c); return c; }
+        Deque<BlockChange> history = BLOCK_HISTORY.computeIfAbsent(change.playerUuid(), id -> new ArrayDeque<>());
+        synchronized (history) {
+            history.addLast(change);
+            int maxSize = ChronosConfig.getBufferTicks();
+            while (history.size() > maxSize) history.pollFirst();
+        }
+        Deque<BlockChange> undo = BLOCK_UNDO_STACK.get(change.playerUuid());
+        if (undo != null) undo.clear();
     }
 
-    public static void recordEntitySnapshot(Entity entity) {
-        if (entity instanceof PlayerEntity || entity.isRemoved() || !PAUSED_PLAYERS.isEmpty()) return;
-        NbtCompound nbt = new NbtCompound(); entity.writeNbt(nbt);
-        EntitySnapshot snapshot = new EntitySnapshot(currentTick, entity.getUuid(), Registries.ENTITY_TYPE.getId(entity.getType()).toString(), entity.getWorld().getRegistryKey().getValue().toString(), nbt.copy());
-        synchronized (ENTITY_HISTORY) {
-            ENTITY_HISTORY.addLast(snapshot); int max = Math.max(20000, ChronosConfig.getBufferTicks() * 64); while (ENTITY_HISTORY.size() > max) ENTITY_HISTORY.pollFirst();
+    public static BlockChange popMatchingBlockChange(UUID playerUuid, long minTick) {
+        Deque<BlockChange> history = BLOCK_HISTORY.get(playerUuid);
+        if (history == null) return null;
+        synchronized (history) {
+            BlockChange last = history.peekLast();
+            if (last == null || last.tick() < minTick) return null;
+            history.pollLast();
+            BLOCK_UNDO_STACK.computeIfAbsent(playerUuid, id -> new ArrayDeque<>()).addLast(last);
+            return last;
         }
     }
-    public static void recordEntitySnapshot(LivingEntity entity) { recordEntitySnapshot((Entity) entity); }
+
+    public static BlockChange redoMatchingBlockChange(UUID playerUuid, long maxTick) {
+        Deque<BlockChange> undo = BLOCK_UNDO_STACK.get(playerUuid);
+        if (undo == null) return null;
+        synchronized (undo) {
+            BlockChange last = undo.peekLast();
+            if (last == null || last.tick() > maxTick) return null;
+            undo.pollLast();
+            BLOCK_HISTORY.computeIfAbsent(playerUuid, id -> new ArrayDeque<>()).addLast(last);
+            return last;
+        }
+    }
+
+    public static void recordEntitySnapshot(LivingEntity entity) {
+        synchronized (ENTITY_HISTORY) {
+            ENTITY_HISTORY.addLast(new EntitySnapshot(currentTick, entity.getUuid(), entity.getX(), entity.getY(), entity.getZ(), entity.getYaw(), entity.getPitch(), entity.getHealth()));
+            int maxSize = ChronosConfig.getBufferTicks() * 8;
+            while (ENTITY_HISTORY.size() > maxSize) ENTITY_HISTORY.pollFirst();
+        }
+    }
+
+    public static List<EntitySnapshot> getEntitySnapshotsSince(long minTick) {
+        synchronized (ENTITY_HISTORY) {
+            List<EntitySnapshot> result = new ArrayList<>();
+            for (EntitySnapshot s : ENTITY_HISTORY) if (s.tick() >= minTick) result.add(s);
+            return result;
+        }
+    }
+
     public static List<EntitySnapshot> getEntitySnapshotsNear(long targetTick, long minTick, long maxTick) {
         synchronized (ENTITY_HISTORY) {
-            Map<UUID, EntitySnapshot> best = new HashMap<>(); Map<UUID, Long> bestDiff = new HashMap<>();
+            Map<UUID, EntitySnapshot> best = new java.util.HashMap<>();
+            Map<UUID, Long> bestDiff = new java.util.HashMap<>();
             for (EntitySnapshot s : ENTITY_HISTORY) {
-                if (s.tick() < minTick || s.tick() > maxTick) continue; long diff = Math.abs(s.tick() - targetTick);
-                if (!bestDiff.containsKey(s.entityUuid()) || diff < bestDiff.get(s.entityUuid())) { bestDiff.put(s.entityUuid(), diff); best.put(s.entityUuid(), s); }
+                if (s.tick() < minTick || s.tick() > maxTick) continue;
+                long diff = Math.abs(s.tick() - targetTick);
+                Long current = bestDiff.get(s.entityUuid());
+                if (current == null || diff < current) { bestDiff.put(s.entityUuid(), diff); best.put(s.entityUuid(), s); }
             }
             return new ArrayList<>(best.values());
         }
     }
-    public static void recordDeath(DeathRecord record) { synchronized (DEATH_RECORDS) { DEATH_RECORDS.addLast(record); while (DEATH_RECORDS.size() > 2000) DEATH_RECORDS.pollFirst(); } }
+
+    public static void recordDeath(DeathRecord record) {
+        synchronized (DEATH_RECORDS) {
+            DEATH_RECORDS.addLast(record);
+            while (DEATH_RECORDS.size() > 2000) DEATH_RECORDS.pollFirst();
+        }
+    }
+
     public static List<DeathRecord> popDeathsBetween(long minTick, long maxTick) {
-        synchronized (DEATH_RECORDS) { List<DeathRecord> result = new ArrayList<>(); DEATH_RECORDS.removeIf(d -> { if (d.tick() >= minTick && d.tick() <= maxTick) { result.add(d); return true; } return false; }); return result; }
+        synchronized (DEATH_RECORDS) {
+            List<DeathRecord> result = new ArrayList<>();
+            DEATH_RECORDS.removeIf(d -> {
+                if (d.tick() >= minTick && d.tick() <= maxTick) { result.add(d); return true; }
+                return false;
+            });
+            return result;
+        }
     }
 }

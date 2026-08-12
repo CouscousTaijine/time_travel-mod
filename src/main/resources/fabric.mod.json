@@ -5,12 +5,12 @@
   "name": "Chronos - Time Rewind",
   "description": "Enregistre en permanence les actions des joueurs et permet de remonter le temps avec un item.",
   "authors": ["Negger"],
+  "contact": {},
   "license": "MIT",
   "icon": "assets/chronos/icon.png",
   "environment": "*",
   "entrypoints": {
-    "main": ["com.negger.chronos.ChronosMod"],
-    "client": ["com.negger.chronos.ChronosClient"]
+    "main": ["com.negger.chronos.ChronosMod"]
   },
   "mixins": [],
   "depends": {

@@ -3,8 +3,11 @@ package com.negger.chronos.history;
 import com.negger.chronos.ChronosMod;
 import net.minecraft.nbt.NbtCompound;
 import net.minecraft.nbt.NbtIo;
-import net.minecraft.nbt.NbtList;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -13,94 +16,92 @@ import java.util.List;
 import java.util.UUID;
 
 public class PersistenceIO {
+
+    private static final int RECORD_SIZE = 48;
+
     public record ClockAnchor(long tick, long epochMillis) {}
 
-    public static void saveMeta(Path dir, long lastTick) {
+    public static void saveMeta(Path chronosDir, long lastTick) {
         try {
-            Files.createDirectories(dir);
+            Files.createDirectories(chronosDir);
             NbtCompound root = new NbtCompound();
             root.putLong("lastTick", lastTick);
             root.putLong("lastEpochMillis", System.currentTimeMillis());
-            NbtIo.writeCompressed(root, dir.resolve("meta.dat").toFile());
-        } catch (IOException e) { ChronosMod.LOGGER.warn("Chronos : impossible de sauvegarder les métadonnées", e); }
+            NbtIo.writeCompressed(root, chronosDir.resolve("meta.dat").toFile());
+        } catch (IOException e) {
+            ChronosMod.LOGGER.warn("Chronos : impossible de sauvegarder les métadonnées d'horloge", e);
+        }
     }
 
-    public static ClockAnchor loadMeta(Path dir) {
-        java.io.File file = dir.resolve("meta.dat").toFile();
+    public static ClockAnchor loadMeta(Path chronosDir) {
+        java.io.File file = chronosDir.resolve("meta.dat").toFile();
         if (!file.exists()) return null;
         try {
             NbtCompound root = NbtIo.readCompressed(file);
             return new ClockAnchor(root.getLong("lastTick"), root.getLong("lastEpochMillis"));
         } catch (IOException e) {
-            ChronosMod.LOGGER.warn("Chronos : impossible de charger les métadonnées", e);
+            ChronosMod.LOGGER.warn("Chronos : impossible de charger les métadonnées d'horloge", e);
             return null;
         }
     }
 
-    public static void save(Path dir, UUID uuid, List<TimeSnapshot> history) {
-        if (history.isEmpty()) return;
+    public static void save(Path chronosDir, UUID uuid, List<TimeSnapshot> longTerm) {
+        if (longTerm.isEmpty()) return;
         try {
-            Files.createDirectories(dir);
-            NbtCompound root = new NbtCompound();
-            root.putInt("version", 4);
-            NbtList list = new NbtList();
-            for (TimeSnapshot s : history) {
-                NbtCompound n = new NbtCompound();
-                n.putLong("tick", s.tick());
-                n.putDouble("x", s.x()); n.putDouble("y", s.y()); n.putDouble("z", s.z());
-                n.putFloat("yaw", s.yaw()); n.putFloat("pitch", s.pitch());
-                n.putFloat("health", s.health()); n.putInt("food", s.foodLevel()); n.putFloat("sat", s.saturation());
-                n.putInt("xpLevel", s.experienceLevel()); n.putInt("xpTotal", s.totalExperience()); n.putFloat("xpProgress", s.experienceProgress());
-                n.putInt("selectedSlot", s.selectedSlot());
-                n.putLong("worldTime", s.worldTime());
-                n.putBoolean("raining", s.raining()); n.putBoolean("thundering", s.thundering());
-                n.putInt("clearWeatherTime", s.clearWeatherTime()); n.putInt("rainTime", s.rainTime()); n.putInt("thunderTime", s.thunderTime());
-                if (s.inventoryNbt() != null) n.put("inventory", s.inventoryNbt().copy());
-                list.add(n);
+            Files.createDirectories(chronosDir);
+            java.io.File file = chronosDir.resolve(uuid + ".dat").toFile();
+            ByteArrayOutputStream baos = new ByteArrayOutputStream(longTerm.size() * RECORD_SIZE);
+            try (DataOutputStream out = new DataOutputStream(baos)) {
+                for (TimeSnapshot s : longTerm) {
+                    out.writeLong(s.tick());
+                    out.writeDouble(s.x());
+                    out.writeDouble(s.y());
+                    out.writeDouble(s.z());
+                    out.writeFloat(s.yaw());
+                    out.writeFloat(s.pitch());
+                    out.writeFloat(s.health());
+                    out.writeInt(s.foodLevel());
+                    out.writeFloat(s.saturation());
+                    out.writeLong(s.worldTime());
+                }
             }
-            root.put("snapshots", list);
-            NbtIo.writeCompressed(root, dir.resolve(uuid + ".dat").toFile());
-        } catch (IOException e) { ChronosMod.LOGGER.warn("Chronos : impossible de sauvegarder l'historique de " + uuid, e); }
+            NbtCompound root = new NbtCompound();
+            root.putInt("version", 2);
+            root.putInt("count", longTerm.size());
+            root.putByteArray("data", baos.toByteArray());
+            NbtIo.writeCompressed(root, file);
+        } catch (IOException e) {
+            ChronosMod.LOGGER.warn("Chronos : impossible de sauvegarder l'historique de " + uuid, e);
+        }
     }
 
-    public static List<TimeSnapshot> load(Path dir, UUID uuid) {
+    public static List<TimeSnapshot> load(Path chronosDir, UUID uuid) {
         List<TimeSnapshot> result = new ArrayList<>();
-        java.io.File file = dir.resolve(uuid + ".dat").toFile();
+        java.io.File file = chronosDir.resolve(uuid + ".dat").toFile();
         if (!file.exists()) return result;
         try {
             NbtCompound root = NbtIo.readCompressed(file);
-            if (root.contains("snapshots")) {
-                NbtList list = root.getList("snapshots", 10);
-                for (int i = 0; i < list.size(); i++) {
-                    NbtCompound n = list.getCompound(i);
-                    NbtCompound inventory = n.contains("inventory") ? n.getCompound("inventory").copy() : null;
-                    result.add(new TimeSnapshot(
-                            n.getLong("tick"), n.getDouble("x"), n.getDouble("y"), n.getDouble("z"),
-                            n.getFloat("yaw"), n.getFloat("pitch"), n.getFloat("health"), n.getInt("food"), n.getFloat("sat"),
-                            n.getInt("xpLevel"), n.getInt("xpTotal"), n.getFloat("xpProgress"), n.getInt("selectedSlot"),
-                            n.getLong("worldTime"), n.getBoolean("raining"), n.getBoolean("thundering"),
-                            n.getInt("clearWeatherTime"), n.getInt("rainTime"), n.getInt("thunderTime"), inventory
-                    ));
-                }
-                return result;
-            }
-
             int count = root.getInt("count");
             byte[] data = root.getByteArray("data");
             int version = root.contains("version") ? root.getInt("version") : 1;
-            try (java.io.DataInputStream in = new java.io.DataInputStream(new java.io.ByteArrayInputStream(data))) {
+            try (DataInputStream in = new DataInputStream(new ByteArrayInputStream(data))) {
                 for (int i = 0; i < count; i++) {
                     long tick = in.readLong();
                     double x = version >= 2 ? in.readDouble() : in.readFloat();
                     double y = version >= 2 ? in.readDouble() : in.readFloat();
                     double z = version >= 2 ? in.readDouble() : in.readFloat();
-                    float yaw = in.readFloat(), pitch = in.readFloat(), health = in.readFloat();
-                    int food = in.readInt(); float sat = in.readFloat();
+                    float yaw = in.readFloat();
+                    float pitch = in.readFloat();
+                    float health = in.readFloat();
+                    int food = in.readInt();
+                    float sat = in.readFloat();
                     long worldTime = version >= 2 ? in.readLong() : 0L;
                     result.add(new TimeSnapshot(tick, x, y, z, yaw, pitch, health, food, sat, worldTime));
                 }
             }
-        } catch (IOException e) { ChronosMod.LOGGER.warn("Chronos : impossible de charger l'historique de " + uuid, e); }
+        } catch (IOException e) {
+            ChronosMod.LOGGER.warn("Chronos : impossible de charger l'historique de " + uuid, e);
+        }
         return result;
     }
 }
