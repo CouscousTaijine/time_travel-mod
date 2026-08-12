@@ -6,6 +6,7 @@ import com.negger.chronos.history.DeathRecord;
 import com.negger.chronos.history.HistoryManager;
 import com.negger.chronos.history.PersistenceIO;
 import com.negger.chronos.item.ChronosShardItem;
+import com.negger.chronos.item.DimensionPortalItem;
 import com.negger.chronos.listener.PlacementTracker;
 import com.negger.chronos.rewind.RewindManager;
 import net.fabricmc.api.ModInitializer;
@@ -18,22 +19,34 @@ import net.fabricmc.fabric.api.event.player.UseBlockCallback;
 import net.fabricmc.fabric.api.item.v1.FabricItemSettings;
 import net.fabricmc.fabric.api.itemgroup.v1.ItemGroupEvents;
 import net.fabricmc.loader.api.FabricLoader;
+import net.minecraft.block.Blocks;
 import net.minecraft.entity.LivingEntity;
 import net.minecraft.entity.player.PlayerEntity;
 import net.minecraft.item.Item;
 import net.minecraft.item.ItemGroups;
 import net.minecraft.nbt.NbtCompound;
-import net.minecraft.registry.Registries;
+import net.minecraft.particle.ParticleTypes;
 import net.minecraft.registry.Registry;
+import net.minecraft.registry.Registries;
+import net.minecraft.registry.RegistryKey;
+import net.minecraft.registry.RegistryKeys;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.network.ServerPlayerEntity;
+import net.minecraft.server.world.ServerWorld;
+import net.minecraft.sound.SoundCategory;
+import net.minecraft.sound.SoundEvents;
 import net.minecraft.util.ActionResult;
 import net.minecraft.util.Identifier;
 import net.minecraft.util.WorldSavePath;
+import net.minecraft.util.math.BlockPos;
+import net.minecraft.world.World;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.nio.file.Path;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.UUID;
 
 public class ChronosMod implements ModInitializer {
 
@@ -41,6 +54,15 @@ public class ChronosMod implements ModInitializer {
     public static final Logger LOGGER = LoggerFactory.getLogger(MOD_ID);
 
     public static Item CHRONOS_SHARD;
+    public static Item DIMENSION_PORTAL;
+
+    public static final RegistryKey<World> DIMENSION_PORTAL_WORLD = RegistryKey.of(
+            RegistryKeys.WORLD,
+            new Identifier(MOD_ID, "dimension_portal")
+    );
+
+    private static final Map<UUID, ReturnPosition> PORTAL_RETURN_POSITIONS = new HashMap<>();
+    private static final Map<UUID, Boolean> PORTAL_WORLD_PREPARED = new HashMap<>();
 
     @Override
     public void onInitialize() {
@@ -62,7 +84,16 @@ public class ChronosMod implements ModInitializer {
                 new ChronosShardItem(new FabricItemSettings().maxCount(1))
         );
 
-        ItemGroupEvents.modifyEntriesEvent(ItemGroups.TOOLS).register(entries -> entries.add(CHRONOS_SHARD));
+        DIMENSION_PORTAL = Registry.register(
+                Registries.ITEM,
+                new Identifier(MOD_ID, "dimension_portal"),
+                new DimensionPortalItem(new FabricItemSettings().maxCount(1))
+        );
+
+        ItemGroupEvents.modifyEntriesEvent(ItemGroups.TOOLS).register(entries -> {
+            entries.add(CHRONOS_SHARD);
+            entries.add(DIMENSION_PORTAL);
+        });
     }
 
     private void registerEvents() {
@@ -76,15 +107,19 @@ public class ChronosMod implements ModInitializer {
             }
         });
 
-        // Tick serveur : avance l'horloge, enregistre joueurs + entités, fait avancer les rewinds actifs
         ServerTickEvents.END_SERVER_TICK.register(server -> {
             HistoryManager.tick();
             PlacementTracker.resolvePending();
 
-            server.getPlayerManager().getPlayerList().forEach(player -> {
+            for (ServerPlayerEntity player : server.getPlayerManager().getPlayerList()) {
                 HistoryManager.recordSnapshot(player);
                 HistoryManager.recordLongTermIfDue(player);
-            });
+
+                if (player.getServerWorld().getRegistryKey().equals(DIMENSION_PORTAL_WORLD)
+                        && player.getY() < 55.0) {
+                    returnFromPortalVoid(player);
+                }
+            }
 
             for (var onlinePlayer : server.getPlayerManager().getPlayerList()) {
                 var nearby = onlinePlayer.getServerWorld().getEntitiesByClass(
@@ -99,7 +134,6 @@ public class ChronosMod implements ModInitializer {
 
             RewindManager.tickAll();
 
-            // Sauvegarde automatique toutes les 5 minutes (filet de sécurité en cas de crash)
             if (HistoryManager.getCurrentTick() % 6000 == 0) {
                 for (ServerPlayerEntity player : server.getPlayerManager().getPlayerList()) {
                     PersistenceIO.save(getChronosDir(server), player.getUuid(), HistoryManager.getLongTermHistory(player.getUuid()));
@@ -108,7 +142,6 @@ public class ChronosMod implements ModInitializer {
             }
         });
 
-        // Un joueur se connecte -> on recharge son historique longue durée depuis le disque
         net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents.JOIN.register((handler, sender, server) -> {
             var loaded = PersistenceIO.load(getChronosDir(server), handler.player.getUuid());
             if (!loaded.isEmpty()) {
@@ -118,7 +151,6 @@ public class ChronosMod implements ModInitializer {
             }
         });
 
-        // Le serveur s'arrête -> on sauvegarde tout le monde avant de fermer
         ServerLifecycleEvents.SERVER_STOPPING.register(server -> {
             for (ServerPlayerEntity player : server.getPlayerManager().getPlayerList()) {
                 PersistenceIO.save(getChronosDir(server), player.getUuid(), HistoryManager.getLongTermHistory(player.getUuid()));
@@ -126,22 +158,20 @@ public class ChronosMod implements ModInitializer {
             PersistenceIO.saveMeta(getChronosDir(server), HistoryManager.getCurrentTick());
         });
 
-        // Un animal/monstre meurt -> on garde son NBT complet pour pouvoir le ressusciter
         ServerLivingEntityEvents.AFTER_DEATH.register((entity, damageSource) -> {
             if (entity instanceof PlayerEntity) return;
             NbtCompound nbt = new NbtCompound();
             entity.writeNbt(nbt);
             HistoryManager.recordDeath(new DeathRecord(
                     HistoryManager.getCurrentTick(),
-                    net.minecraft.registry.Registries.ENTITY_TYPE.getId(entity.getType()).toString(),
+                    Registries.ENTITY_TYPE.getId(entity.getType()).toString(),
                     nbt,
                     entity.getX(), entity.getY(), entity.getZ()
             ));
         });
 
-        // Cassage de bloc par un joueur -> on enregistre l'ancien état pour pouvoir le restaurer
         PlayerBlockBreakEvents.AFTER.register((world, player, pos, state, blockEntity) -> {
-            if (player instanceof net.minecraft.server.network.ServerPlayerEntity serverPlayer) {
+            if (player instanceof ServerPlayerEntity serverPlayer) {
                 HistoryManager.recordBlockChange(new BlockChange(
                         HistoryManager.getCurrentTick(),
                         pos.toImmutable(),
@@ -153,9 +183,8 @@ public class ChronosMod implements ModInitializer {
             }
         });
 
-        // Interaction avec un bloc (pose potentielle) -> vérifié un tick plus tard
         UseBlockCallback.EVENT.register((player, world, hand, hitResult) -> {
-            if (!world.isClient() && player instanceof net.minecraft.server.network.ServerPlayerEntity serverPlayer) {
+            if (!world.isClient() && player instanceof ServerPlayerEntity serverPlayer) {
                 var targetPos = hitResult.getBlockPos().offset(hitResult.getSide());
                 PlacementTracker.queueCheck(serverPlayer, world, targetPos);
                 PlacementTracker.queueCheck(serverPlayer, world, hitResult.getBlockPos());
@@ -163,16 +192,95 @@ public class ChronosMod implements ModInitializer {
             return ActionResult.PASS;
         });
 
-        // Un joueur se déconnecte -> on sauvegarde son historique et on libère la mémoire
         net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents.DISCONNECT.register((handler, server) -> {
             PersistenceIO.save(getChronosDir(server), handler.player.getUuid(), HistoryManager.getLongTermHistory(handler.player.getUuid()));
             HistoryManager.unloadLongTermFromMemory(handler.player.getUuid());
             RewindManager.clear(handler.player.getUuid());
             HistoryManager.clearPlayerHistory(handler.player.getUuid());
+            PORTAL_RETURN_POSITIONS.remove(handler.player.getUuid());
+            PORTAL_WORLD_PREPARED.remove(handler.player.getUuid());
         });
+    }
+
+    public static void savePortalReturnPosition(ServerPlayerEntity player) {
+        PORTAL_RETURN_POSITIONS.put(player.getUuid(), new ReturnPosition(
+                player.getX(), player.getY(), player.getZ(), player.getYaw(), player.getPitch()
+        ));
+    }
+
+    public static double getReturnX(ServerPlayerEntity player) {
+        ReturnPosition pos = PORTAL_RETURN_POSITIONS.get(player.getUuid());
+        return pos == null ? player.getX() : pos.x;
+    }
+
+    public static double getReturnY(ServerPlayerEntity player) {
+        ReturnPosition pos = PORTAL_RETURN_POSITIONS.get(player.getUuid());
+        return pos == null ? player.getY() : pos.y;
+    }
+
+    public static double getReturnZ(ServerPlayerEntity player) {
+        ReturnPosition pos = PORTAL_RETURN_POSITIONS.get(player.getUuid());
+        return pos == null ? player.getZ() : pos.z;
+    }
+
+    public static void returnFromPortalVoid(ServerPlayerEntity player) {
+        ServerWorld overworld = player.getServer().getOverworld();
+        ReturnPosition pos = PORTAL_RETURN_POSITIONS.get(player.getUuid());
+        double x = pos == null ? overworld.getSpawnPos().getX() + 0.5 : pos.x;
+        double y = pos == null ? overworld.getSpawnPos().getY() + 1.0 : pos.y;
+        double z = pos == null ? overworld.getSpawnPos().getZ() + 0.5 : pos.z;
+        float yaw = pos == null ? player.getYaw() : pos.yaw;
+        float pitch = pos == null ? player.getPitch() : pos.pitch;
+
+        player.teleport(overworld, x, y, z, yaw, pitch);
+        player.playSound(SoundEvents.BLOCK_PORTAL_TRAVEL, 0.8f, 0.9f);
+    }
+
+    public static void preparePortalWorld(ServerWorld world) {
+        if (!PORTAL_WORLD_PREPARED.isEmpty()) {
+            return;
+        }
+
+        BlockPos center = new BlockPos(0, 64, 0);
+
+        for (int x = -2; x <= 2; x++) {
+            for (int z = -2; z <= 2; z++) {
+                world.setBlockState(center.add(x, 0, z), Blocks.DIRT.getDefaultState(), 3);
+                world.setBlockState(center.add(x, 1, z), Blocks.GRASS_BLOCK.getDefaultState(), 3);
+            }
+        }
+
+        // Petit arbre central, volontairement compact pour tenir sur l'île 5x5.
+        for (int y = 2; y <= 5; y++) {
+            world.setBlockState(center.add(0, y, 0), Blocks.OAK_LOG.getDefaultState(), 3);
+        }
+
+        for (int x = -2; x <= 2; x++) {
+            for (int z = -2; z <= 2; z++) {
+                if (Math.abs(x) + Math.abs(z) <= 3) {
+                    world.setBlockState(center.add(x, 5, z), Blocks.OAK_LEAVES.getDefaultState(), 3);
+                }
+            }
+        }
+
+        for (int x = -1; x <= 1; x++) {
+            for (int z = -1; z <= 1; z++) {
+                if (x != 0 || z != 0) {
+                    world.setBlockState(center.add(x, 6, z), Blocks.OAK_LEAVES.getDefaultState(), 3);
+                }
+            }
+        }
+    }
+
+    public static void spawnPortalParticles(ServerWorld world, BlockPos pos) {
+        world.spawnParticles(ParticleTypes.PORTAL, pos.getX() + 0.5, pos.getY() + 1.0, pos.getZ() + 0.5,
+                80, 1.2, 1.0, 1.2, 0.15);
+        world.playSound(null, pos, SoundEvents.BLOCK_PORTAL_AMBIENT, SoundCategory.PLAYERS, 0.7f, 1.3f);
     }
 
     private static Path getChronosDir(MinecraftServer server) {
         return server.getSavePath(WorldSavePath.ROOT).resolve("chronos");
     }
+
+    private record ReturnPosition(double x, double y, double z, float yaw, float pitch) {}
 }
