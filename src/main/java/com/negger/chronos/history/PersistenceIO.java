@@ -22,9 +22,7 @@ public class PersistenceIO {
             root.putLong("lastTick", lastTick);
             root.putLong("lastEpochMillis", System.currentTimeMillis());
             NbtIo.writeCompressed(root, dir.resolve("meta.dat").toFile());
-        } catch (IOException e) {
-            ChronosMod.LOGGER.warn("Chronos : impossible de sauvegarder les métadonnées", e);
-        }
+        } catch (IOException e) { ChronosMod.LOGGER.warn("Chronos : impossible de sauvegarder les métadonnées", e); }
     }
 
     public static ClockAnchor loadMeta(Path dir) {
@@ -44,29 +42,25 @@ public class PersistenceIO {
         try {
             Files.createDirectories(dir);
             NbtCompound root = new NbtCompound();
-            root.putInt("version", 3);
+            root.putInt("version", 4);
             NbtList list = new NbtList();
             for (TimeSnapshot s : history) {
                 NbtCompound n = new NbtCompound();
                 n.putLong("tick", s.tick());
                 n.putDouble("x", s.x()); n.putDouble("y", s.y()); n.putDouble("z", s.z());
                 n.putFloat("yaw", s.yaw()); n.putFloat("pitch", s.pitch());
-                n.putFloat("health", s.health()); n.putInt("food", s.foodLevel());
-                n.putFloat("sat", s.saturation());
-                n.putInt("xpLevel", s.experienceLevel()); n.putInt("xpTotal", s.totalExperience());
-                n.putFloat("xpProgress", s.experienceProgress());
+                n.putFloat("health", s.health()); n.putInt("food", s.foodLevel()); n.putFloat("sat", s.saturation());
+                n.putInt("xpLevel", s.experienceLevel()); n.putInt("xpTotal", s.totalExperience()); n.putFloat("xpProgress", s.experienceProgress());
+                n.putInt("selectedSlot", s.selectedSlot());
                 n.putLong("worldTime", s.worldTime());
                 n.putBoolean("raining", s.raining()); n.putBoolean("thundering", s.thundering());
-                n.putInt("clearWeatherTime", s.clearWeatherTime());
-                n.putInt("rainTime", s.rainTime()); n.putInt("thunderTime", s.thunderTime());
+                n.putInt("clearWeatherTime", s.clearWeatherTime()); n.putInt("rainTime", s.rainTime()); n.putInt("thunderTime", s.thunderTime());
                 if (s.inventoryNbt() != null) n.put("inventory", s.inventoryNbt().copy());
                 list.add(n);
             }
             root.put("snapshots", list);
             NbtIo.writeCompressed(root, dir.resolve(uuid + ".dat").toFile());
-        } catch (IOException e) {
-            ChronosMod.LOGGER.warn("Chronos : impossible de sauvegarder l'historique de " + uuid, e);
-        }
+        } catch (IOException e) { ChronosMod.LOGGER.warn("Chronos : impossible de sauvegarder l'historique de " + uuid, e); }
     }
 
     public static List<TimeSnapshot> load(Path dir, UUID uuid) {
@@ -82,8 +76,8 @@ public class PersistenceIO {
                     NbtCompound inventory = n.contains("inventory") ? n.getCompound("inventory").copy() : null;
                     result.add(new TimeSnapshot(
                             n.getLong("tick"), n.getDouble("x"), n.getDouble("y"), n.getDouble("z"),
-                            n.getFloat("yaw"), n.getFloat("pitch"), n.getFloat("health"), n.getInt("food"),
-                            n.getFloat("sat"), n.getInt("xpLevel"), n.getInt("xpTotal"), n.getFloat("xpProgress"),
+                            n.getFloat("yaw"), n.getFloat("pitch"), n.getFloat("health"), n.getInt("food"), n.getFloat("sat"),
+                            n.getInt("xpLevel"), n.getInt("xpTotal"), n.getFloat("xpProgress"), n.getInt("selectedSlot"),
                             n.getLong("worldTime"), n.getBoolean("raining"), n.getBoolean("thundering"),
                             n.getInt("clearWeatherTime"), n.getInt("rainTime"), n.getInt("thunderTime"), inventory
                     ));
@@ -91,7 +85,6 @@ public class PersistenceIO {
                 return result;
             }
 
-            // Compatibilité avec les anciennes sauvegardes binaires v1/v2.
             int count = root.getInt("count");
             byte[] data = root.getByteArray("data");
             int version = root.contains("version") ? root.getInt("version") : 1;
@@ -107,9 +100,7 @@ public class PersistenceIO {
                     result.add(new TimeSnapshot(tick, x, y, z, yaw, pitch, health, food, sat, worldTime));
                 }
             }
-        } catch (IOException e) {
-            ChronosMod.LOGGER.warn("Chronos : impossible de charger l'historique de " + uuid, e);
-        }
+        } catch (IOException e) { ChronosMod.LOGGER.warn("Chronos : impossible de charger l'historique de " + uuid, e); }
         return result;
     }
 }
