@@ -1,0 +1,12 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "com.negger.chronos.mixin",
+  "compatibilityLevel": "JAVA_17",
+  "mixins": [
+    "WorldBlockHistoryMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}
