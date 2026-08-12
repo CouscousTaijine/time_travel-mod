@@ -6,13 +6,13 @@ import com.negger.chronos.history.EntitySnapshot;
 import com.negger.chronos.history.HistoryManager;
 import com.negger.chronos.history.TimeSnapshot;
 import com.negger.chronos.network.ChronosNetworking;
+import net.fabricmc.fabric.api.networking.v1.PacketByteBufs;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
 import net.minecraft.block.Block;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.EntityType;
 import net.minecraft.entity.player.PlayerEntity;
 import net.minecraft.item.Hand;
-import net.minecraft.item.ItemStack;
 import net.minecraft.nbt.NbtCompound;
 import net.minecraft.nbt.NbtElement;
 import net.minecraft.registry.Registries;
@@ -74,9 +74,13 @@ public class RewindManager {
         if (!p.promoted) {
             if (p.sneaking) setSavepoint(player);
             else onReturnToPresent(player);
-        } else {
-            Session s = SESSIONS.get(id);
-            if (s != null) s.mode = null;
+            return;
+        }
+
+        Session session = SESSIONS.get(id);
+        if (session != null) finishAtPast(player, session);
+        else {
+            HistoryManager.setPaused(id, false);
             sendSmoothPacket(player, false);
         }
     }
@@ -96,11 +100,10 @@ public class RewindManager {
             if (s.mode == null) continue;
             ServerPlayerEntity player = findPlayer(e.getKey());
             if (player == null) continue;
-            int steps = Math.max(1, (int) Math.round(ChronosConfig.rewindSpeed));
-            // Une seule restauration logique par tick évite les gros sauts et
-            // laisse le client interpoler le mouvement entre deux snapshots.
-            steps = Math.min(steps, 2);
-            for (int i = 0; i < steps; i++) if (!advanceOneStep(player, s)) break;
+            // 1 snapshot/tick = 20 positions/s. Le client les interpole.
+            for (int i = 0; i < Math.min(2, Math.max(1, (int) Math.round(ChronosConfig.rewindSpeed))); i++) {
+                if (!advanceOneStep(player, s)) break;
+            }
         }
     }
 
@@ -124,9 +127,7 @@ public class RewindManager {
 
     private static void beginHeldBackward(ServerPlayerEntity player) {
         Session s = getOrCreateSession(player);
-        if (s == null) return;
-        s.mode = Mode.HELD_BACKWARD;
-        s.targetCursor = null;
+        if (s != null) s.mode = Mode.HELD_BACKWARD;
     }
 
     private static void beginScrubToSavepoint(ServerPlayerEntity player) {
@@ -141,13 +142,11 @@ public class RewindManager {
         s.targetCursor = closestIndexForTick(s.buffer, savepoint.tick());
     }
 
-    /** Tap sans maintien : retour au PRESENT en une seule opération visible. */
+    /** Retour au présent instantané: aucune animation de replay entre passé et présent. */
     public static void onReturnToPresent(ServerPlayerEntity player) {
         Session s = SESSIONS.get(player.getUuid());
         if (s == null) return;
 
-        // Toutes les modifications de blocs annulées sont rejouées sans animation
-        // temporelle intermédiaire. Puis l'état exact du dernier snapshot est appliqué.
         BlockChange change;
         while ((change = HistoryManager.redoMatchingBlockChange(player.getUuid(), Long.MAX_VALUE)) != null) {
             applyBlockChange(player, change, false, false);
@@ -162,16 +161,17 @@ public class RewindManager {
         player.networkHandler.syncWithPlayerPosition();
     }
 
+    private static void finishAtPast(ServerPlayerEntity player, Session session) {
+        HistoryManager.truncateHistoryTo(player.getUuid(), session.cursor + 1);
+        SESSIONS.remove(player.getUuid());
+        HistoryManager.setPaused(player.getUuid(), false);
+        sendSmoothPacket(player, false);
+    }
+
     public static void setSavepoint(ServerPlayerEntity player) {
-        Session s = SESSIONS.get(player.getUuid());
-        TimeSnapshot current;
-        if (s != null) current = s.buffer.get(s.cursor);
-        else {
-            List<TimeSnapshot> h = HistoryManager.snapshotHistory(player.getUuid());
-            current = h.isEmpty() ? null : h.get(h.size() - 1);
-            if (current == null) return;
-        }
-        SAVEPOINTS.put(player.getUuid(), current);
+        List<TimeSnapshot> h = HistoryManager.snapshotHistory(player.getUuid());
+        if (h.isEmpty()) return;
+        SAVEPOINTS.put(player.getUuid(), h.get(h.size() - 1));
         player.getServerWorld().playSound(null, player.getX(), player.getY(), player.getZ(), SoundEvents.BLOCK_BEACON_ACTIVATE, SoundCategory.PLAYERS, 0.5f, 1.8f);
         player.sendMessage(Text.literal("§dPoint de sauvegarde posé."), true);
     }
@@ -190,7 +190,7 @@ public class RewindManager {
                 (session.mode == Mode.AUTO_TO_TARGET && session.targetCursor < session.cursor);
         int next = backward ? session.cursor - 1 : session.cursor + 1;
         if (next < 0 || next >= session.buffer.size()) {
-            session.mode = null;
+            finishAtPast(player, session);
             return false;
         }
 
@@ -215,23 +215,18 @@ public class RewindManager {
         applySnapshot(player, snapshot, true);
 
         if (session.mode == Mode.AUTO_TO_TARGET && session.cursor == session.targetCursor) {
-            session.mode = null;
-            player.sendMessage(Text.literal("§dPoint de sauvegarde atteint."), true);
-            sendSmoothPacket(player, false);
+            finishAtPast(player, session);
             return false;
         }
         if (session.mode == Mode.HELD_BACKWARD && session.cursor == 0) {
-            session.mode = null;
+            finishAtPast(player, session);
             player.sendMessage(Text.literal("§6Limite de l'historique atteinte."), true);
-            sendSmoothPacket(player, false);
             return false;
         }
         return true;
     }
 
     private static void applySnapshot(ServerPlayerEntity player, TimeSnapshot s, boolean smooth) {
-        // requestTeleport reste l'autorite serveur; le packet Chronos cote client
-        // transforme le couple de teleports en interpolation visuelle.
         player.requestTeleport(s.x(), s.y(), s.z());
         player.setYaw(s.yaw());
         player.setPitch(s.pitch());
@@ -251,7 +246,6 @@ public class RewindManager {
             player.getHungerManager().setFoodLevel(s.foodLevel());
             player.getHungerManager().setSaturationLevel(s.saturation());
         }
-
         player.experienceLevel = s.experienceLevel();
         player.totalExperience = s.totalExperience();
         player.experienceProgress = s.experienceProgress();
@@ -266,7 +260,6 @@ public class RewindManager {
         if (smooth) sendSmoothPacket(player, true);
     }
 
-    /** Reconstitue l'ensemble des entites non-joueur connues au tick cible. */
     private static void restoreEntities(ServerPlayerEntity player, long targetTick) {
         ServerWorld world = player.getServerWorld();
         List<EntitySnapshot> raw = HistoryManager.getEntitySnapshotsNear(targetTick, targetTick - ENTITY_MATCH_WINDOW, targetTick + ENTITY_MATCH_WINDOW);
@@ -286,8 +279,6 @@ public class RewindManager {
             touched.add(entity.getUuid());
         }
 
-        // Une entite morte/disparue dans le present mais vivante dans le passé
-        // est recréée à partir de son NBT historique (animaux, objets, flèches...).
         for (EntitySnapshot snapshot : snapshots.values()) {
             if (touched.contains(snapshot.entityUuid())) continue;
             EntityType<?> type = Registries.ENTITY_TYPE.get(new Identifier(snapshot.entityTypeId()));
@@ -295,9 +286,12 @@ public class RewindManager {
             Entity entity = type.create(world);
             if (entity == null) continue;
             try {
+                NbtCompound nbt = snapshot.nbt().copy();
+                nbt.remove("Health");
+                nbt.remove("DeathTime");
+                nbt.remove("HurtTime");
                 entity.readNbt(snapshot.nbt().copy());
                 world.spawnEntity(entity);
-                touched.add(snapshot.entityUuid());
             } catch (Exception ignored) {
                 entity.discard();
             }
@@ -306,10 +300,8 @@ public class RewindManager {
 
     private static void restoreEntity(Entity entity, EntitySnapshot snapshot) {
         try {
-            NbtCompound nbt = snapshot.nbt().copy();
-            entity.readNbt(nbt);
+            entity.readNbt(snapshot.nbt().copy());
             entity.setVelocity(0, 0, 0);
-            entity.velocityModified = true;
         } catch (Exception ignored) {
             entity.refreshPositionAndAngles(snapshot.x(), snapshot.y(), snapshot.z(), snapshot.yaw(), snapshot.pitch());
         }
@@ -317,10 +309,9 @@ public class RewindManager {
 
     private static void applyBlockChange(ServerPlayerEntity player, BlockChange change, boolean reverse, boolean animate) {
         BlockPos pos = change.pos();
-        var world = player.getServerWorld();
+        ServerWorld world = player.getServerWorld();
         var state = reverse ? change.oldState() : change.newState();
         world.setBlockState(pos, state, Block.NOTIFY_ALL);
-
         if (!animate) return;
         player.swingHand(Hand.MAIN_HAND);
         if (reverse) {
@@ -332,22 +323,15 @@ public class RewindManager {
     }
 
     private static void sendSmoothPacket(ServerPlayerEntity player, boolean active) {
-        var buf = net.fabricmc.fabric.api.networking.v1.PacketByteBufs.create();
-        buf.writeDouble(player.getX());
-        buf.writeDouble(player.getY());
-        buf.writeDouble(player.getZ());
-        buf.writeFloat(player.getYaw());
-        buf.writeFloat(player.getPitch());
-        buf.writeBoolean(active);
+        var buf = PacketByteBufs.create();
+        buf.writeDouble(player.getX()); buf.writeDouble(player.getY()); buf.writeDouble(player.getZ());
+        buf.writeFloat(player.getYaw()); buf.writeFloat(player.getPitch()); buf.writeBoolean(active);
         ServerPlayNetworking.send(player, ChronosNetworking.REWIND_MOTION, buf);
     }
 
     public static boolean isRewinding(UUID id) { return SESSIONS.containsKey(id); }
 
     public static void clear(UUID id) {
-        SESSIONS.remove(id);
-        SAVEPOINTS.remove(id);
-        PENDING.remove(id);
-        HistoryManager.setPaused(id, false);
+        SESSIONS.remove(id); SAVEPOINTS.remove(id); PENDING.remove(id); HistoryManager.setPaused(id, false);
     }
 }
