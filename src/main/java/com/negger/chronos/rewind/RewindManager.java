@@ -76,7 +76,6 @@ public class RewindManager {
             else onReturnToPresent(player);
             return;
         }
-
         Session session = SESSIONS.get(id);
         if (session != null) finishAtPast(player, session);
         else {
@@ -100,7 +99,6 @@ public class RewindManager {
             if (s.mode == null) continue;
             ServerPlayerEntity player = findPlayer(e.getKey());
             if (player == null) continue;
-            // 1 snapshot/tick = 20 positions/s. Le client les interpole.
             for (int i = 0; i < Math.min(2, Math.max(1, (int) Math.round(ChronosConfig.rewindSpeed))); i++) {
                 if (!advanceOneStep(player, s)) break;
             }
@@ -128,6 +126,7 @@ public class RewindManager {
     private static void beginHeldBackward(ServerPlayerEntity player) {
         Session s = getOrCreateSession(player);
         if (s != null) s.mode = Mode.HELD_BACKWARD;
+        HistoryManager.setPaused(player.getUuid(), true);
     }
 
     private static void beginScrubToSavepoint(ServerPlayerEntity player) {
@@ -142,7 +141,6 @@ public class RewindManager {
         s.targetCursor = closestIndexForTick(s.buffer, savepoint.tick());
     }
 
-    /** Retour au présent instantané: aucune animation de replay entre passé et présent. */
     public static void onReturnToPresent(ServerPlayerEntity player) {
         Session s = SESSIONS.get(player.getUuid());
         if (s == null) return;
@@ -162,8 +160,10 @@ public class RewindManager {
     }
 
     private static void finishAtPast(ServerPlayerEntity player, Session session) {
+        // Le snapshot "present" reste dans la session afin qu'un clic droit court
+        // puisse ramener instantanément le monde à l'état d'origine.
         HistoryManager.truncateHistoryTo(player.getUuid(), session.cursor + 1);
-        SESSIONS.remove(player.getUuid());
+        session.mode = null;
         HistoryManager.setPaused(player.getUuid(), false);
         sendSmoothPacket(player, false);
     }
@@ -194,9 +194,7 @@ public class RewindManager {
             return false;
         }
 
-        long oldTick = session.buffer.get(session.cursor).tick();
         long newTick = session.buffer.get(next).tick();
-
         if (backward) {
             BlockChange c;
             while ((c = HistoryManager.popMatchingBlockChange(player.getUuid(), newTick + 1)) != null) {
@@ -256,7 +254,6 @@ public class RewindManager {
             player.getInventory().selectedSlot = Math.max(0, Math.min(8, s.selectedSlot()));
             player.playerScreenHandler.sendContentUpdates();
         }
-
         if (smooth) sendSmoothPacket(player, true);
     }
 
@@ -286,10 +283,6 @@ public class RewindManager {
             Entity entity = type.create(world);
             if (entity == null) continue;
             try {
-                NbtCompound nbt = snapshot.nbt().copy();
-                nbt.remove("Health");
-                nbt.remove("DeathTime");
-                nbt.remove("HurtTime");
                 entity.readNbt(snapshot.nbt().copy());
                 world.spawnEntity(entity);
             } catch (Exception ignored) {
