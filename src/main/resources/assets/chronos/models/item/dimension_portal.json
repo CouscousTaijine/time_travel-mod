@@ -1,7 +1,6 @@
 {
   "parent": "item/generated",
   "textures": {
-    "layer0": "minecraft:item/ender_eye",
-    "layer1": "minecraft:item/amethyst_shard"
+    "layer0": "chronos:item/dimension_portal"
   }
 }
