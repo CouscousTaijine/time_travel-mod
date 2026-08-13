@@ -2,6 +2,8 @@ package com.negger.chronos.history;
 
 import com.negger.chronos.ChronosConfig;
 import net.minecraft.entity.LivingEntity;
+import net.minecraft.nbt.NbtCompound;
+import net.minecraft.nbt.NbtList;
 import net.minecraft.server.network.ServerPlayerEntity;
 
 import java.util.ArrayDeque;
@@ -33,18 +35,37 @@ public class HistoryManager {
         currentTick = anchorTick + elapsedTicks;
     }
 
-    public static void setPaused(UUID playerUuid, boolean paused) {
-        if (paused) PAUSED_PLAYERS.add(playerUuid); else PAUSED_PLAYERS.remove(playerUuid);
-    }
+    public static void setPaused(UUID playerUuid, boolean paused) { if (paused) PAUSED_PLAYERS.add(playerUuid); else PAUSED_PLAYERS.remove(playerUuid); }
     public static boolean isPaused(UUID playerUuid) { return PAUSED_PLAYERS.contains(playerUuid); }
+
+    private static TimeSnapshot snapshot(ServerPlayerEntity player) {
+        var world = player.getServerWorld();
+        NbtList items = new NbtList();
+        player.getInventory().writeNbt(items);
+        NbtCompound inventory = new NbtCompound();
+        inventory.put("Items", items);
+
+        return new TimeSnapshot(
+                currentTick,
+                player.getX(), player.getY(), player.getZ(),
+                player.getYaw(), player.getPitch(),
+                player.getHealth(),
+                player.getHungerManager().getFoodLevel(),
+                player.getHungerManager().getSaturationLevel(),
+                world.getTime(),
+                world.isRaining(),
+                world.isThundering(),
+                world.getClearWeatherTime(),
+                world.getRainTime(),
+                world.getThunderTime(),
+                inventory
+        );
+    }
 
     public static void recordSnapshot(ServerPlayerEntity player) {
         if (isPaused(player.getUuid())) return;
         Deque<TimeSnapshot> history = PLAYER_HISTORY.computeIfAbsent(player.getUuid(), id -> new ArrayDeque<>());
-        history.addLast(new TimeSnapshot(currentTick, player.getX(), player.getY(), player.getZ(),
-                player.getYaw(), player.getPitch(), player.getHealth(),
-                player.getHungerManager().getFoodLevel(), player.getHungerManager().getSaturationLevel(),
-                player.getServerWorld().getTime()));
+        history.addLast(snapshot(player));
         int maxSize = ChronosConfig.getBufferTicks();
         while (history.size() > maxSize) history.pollFirst();
     }
@@ -57,18 +78,12 @@ public class HistoryManager {
     public static void recordLongTermIfDue(ServerPlayerEntity player) {
         if (!ChronosConfig.persistenceEnabled || isPaused(player.getUuid()) || currentTick % 20 != 0) return;
         Deque<TimeSnapshot> history = LONG_TERM_HISTORY.computeIfAbsent(player.getUuid(), id -> new ArrayDeque<>());
-        history.addLast(new TimeSnapshot(currentTick, player.getX(), player.getY(), player.getZ(),
-                player.getYaw(), player.getPitch(), player.getHealth(),
-                player.getHungerManager().getFoodLevel(), player.getHungerManager().getSaturationLevel(),
-                player.getServerWorld().getTime()));
+        history.addLast(snapshot(player));
         long maxSize = ChronosConfig.getPersistCapacity();
         while (history.size() > maxSize) history.pollFirst();
     }
 
-    public static List<TimeSnapshot> getLongTermHistory(UUID playerUuid) {
-        Deque<TimeSnapshot> history = LONG_TERM_HISTORY.get(playerUuid);
-        return history == null ? new ArrayList<>() : new ArrayList<>(history);
-    }
+    public static List<TimeSnapshot> getLongTermHistory(UUID playerUuid) { Deque<TimeSnapshot> history = LONG_TERM_HISTORY.get(playerUuid); return history == null ? new ArrayList<>() : new ArrayList<>(history); }
     public static void setLongTermHistory(UUID playerUuid, List<TimeSnapshot> loaded) { LONG_TERM_HISTORY.put(playerUuid, new ArrayDeque<>(loaded)); }
 
     public static List<TimeSnapshot> combinedHistory(UUID playerUuid) {
@@ -82,10 +97,7 @@ public class HistoryManager {
         return combined;
     }
 
-    public static int getPlayerHistorySize(UUID playerUuid) {
-        Deque<TimeSnapshot> history = PLAYER_HISTORY.get(playerUuid);
-        return history == null ? 0 : history.size();
-    }
+    public static int getPlayerHistorySize(UUID playerUuid) { Deque<TimeSnapshot> history = PLAYER_HISTORY.get(playerUuid); return history == null ? 0 : history.size(); }
 
     public static void truncateHistoryTo(UUID playerUuid, int keepFromStart) {
         Deque<TimeSnapshot> history = PLAYER_HISTORY.get(playerUuid);
@@ -175,10 +187,7 @@ public class HistoryManager {
     public static List<DeathRecord> popDeathsBetween(long minTick, long maxTick) {
         synchronized (DEATH_RECORDS) {
             List<DeathRecord> result = new ArrayList<>();
-            DEATH_RECORDS.removeIf(d -> {
-                if (d.tick() >= minTick && d.tick() <= maxTick) { result.add(d); return true; }
-                return false;
-            });
+            DEATH_RECORDS.removeIf(d -> { if (d.tick() >= minTick && d.tick() <= maxTick) { result.add(d); return true; } return false; });
             return result;
         }
     }
