@@ -9,8 +9,6 @@ import com.negger.chronos.history.TimeSnapshot;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.EntityType;
 import net.minecraft.entity.LivingEntity;
-import net.minecraft.entity.player.PlayerInventory;
-import net.minecraft.item.ItemStack;
 import net.minecraft.nbt.NbtCompound;
 import net.minecraft.nbt.NbtList;
 import net.minecraft.particle.ParticleTypes;
@@ -19,7 +17,6 @@ import net.minecraft.server.world.ServerWorld;
 import net.minecraft.sound.SoundCategory;
 import net.minecraft.sound.SoundEvents;
 import net.minecraft.text.Text;
-import net.minecraft.world.World;
 
 import java.util.List;
 import java.util.Map;
@@ -164,7 +161,7 @@ public class RewindManager {
         if (backward) revertBlocksAndEntities(player, newTick, oldTick); else replayBlocks(player, newTick);
         restoreEntityPositions(newTick);
         session.cursor = newCursor;
-        applySnapshot(player, session.buffer.get(newCursor));
+        applySnapshot(player, session.buffer.get(newCursor), instant);
         if (!instant) playFeedback(player, backward);
 
         boolean reachedTarget = session.mode == Mode.AUTO_TO_TARGET && session.cursor == session.targetCursor;
@@ -181,10 +178,21 @@ public class RewindManager {
         else { session.mode = null; player.sendMessage(Text.literal("§dPoint de sauvegarde atteint."), true); }
     }
 
-    private static void applySnapshot(ServerPlayerEntity player, TimeSnapshot snapshot) {
+    /**
+     * Rewind movement is deliberately applied without teleport packets. Teleport packets
+     * reset the vanilla client's position interpolation and create the visible 20 Hz
+     * "micro-teleport" effect. refreshPositionAndAngles keeps the server authoritative
+     * while allowing normal entity tracking to interpolate the movement on the client.
+     */
+    private static void applySnapshot(ServerPlayerEntity player, TimeSnapshot snapshot, boolean instant) {
         RESTORING = true;
         try {
-            player.teleport(player.getServerWorld(), snapshot.x(), snapshot.y(), snapshot.z(), snapshot.yaw(), snapshot.pitch());
+            if (instant) {
+                player.networkHandler.requestTeleport(snapshot.x(), snapshot.y(), snapshot.z(), snapshot.yaw(), snapshot.pitch());
+            } else {
+                player.refreshPositionAndAngles(snapshot.x(), snapshot.y(), snapshot.z(), snapshot.yaw(), snapshot.pitch());
+                player.setVelocity(0.0, 0.0, 0.0);
+            }
             ServerWorld world = player.getServerWorld();
             world.setTimeOfDay(snapshot.worldTime());
             var properties = (net.minecraft.world.level.ServerWorldProperties) world.getLevelProperties();
