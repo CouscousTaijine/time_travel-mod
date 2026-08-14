@@ -23,6 +23,8 @@ public class HistoryManager {
     private static final Set<UUID> PAUSED_PLAYERS = new CopyOnWriteArraySet<>();
     private static final Map<UUID, Deque<BlockChange>> BLOCK_HISTORY = new ConcurrentHashMap<>();
     private static final Map<UUID, Deque<BlockChange>> BLOCK_UNDO_STACK = new ConcurrentHashMap<>();
+    private static final Deque<GlobalBlockChange> GLOBAL_BLOCK_HISTORY = new ArrayDeque<>();
+    private static final Deque<GlobalBlockChange> GLOBAL_BLOCK_UNDO_STACK = new ArrayDeque<>();
     private static final Deque<EntitySnapshot> ENTITY_HISTORY = new ArrayDeque<>();
     private static final Deque<DeathRecord> DEATH_RECORDS = new ArrayDeque<>();
     private static long currentTick = 0;
@@ -44,7 +46,7 @@ public class HistoryManager {
         player.getInventory().writeNbt(items);
         NbtCompound inventory = new NbtCompound();
         inventory.put("Items", items);
-        return new TimeSnapshot(currentTick, player.getX(), player.getY(), player.getZ(), player.getYaw(), player.getPitch(), player.getHealth(), player.getHungerManager().getFoodLevel(), player.getHungerManager().getSaturationLevel(), world.getTime(), world.isRaining(), world.isThundering(), properties.getClearWeatherTime(), properties.getRainTime(), properties.getThunderTime(), inventory);
+        return new TimeSnapshot(currentTick, player.getX(), player.getY(), player.getZ(), player.getYaw(), player.getPitch(), player.getHealth(), player.getHungerManager().getFoodLevel(), player.getHungerManager().getSaturationLevel(), world.getTimeOfDay(), world.isRaining(), world.isThundering(), properties.getClearWeatherTime(), properties.getRainTime(), properties.getThunderTime(), inventory);
     }
 
     public static void recordSnapshot(ServerPlayerEntity player) {
@@ -67,6 +69,37 @@ public class HistoryManager {
     public static void recordBlockChange(BlockChange change) { Deque<BlockChange> history = BLOCK_HISTORY.computeIfAbsent(change.playerUuid(), id -> new ArrayDeque<>()); synchronized (history) { history.addLast(change); int maxSize = ChronosConfig.getBufferTicks(); while (history.size() > maxSize) history.pollFirst(); } Deque<BlockChange> undo = BLOCK_UNDO_STACK.get(change.playerUuid()); if (undo != null) undo.clear(); }
     public static BlockChange popMatchingBlockChange(UUID playerUuid, long minTick) { Deque<BlockChange> history = BLOCK_HISTORY.get(playerUuid); if (history == null) return null; synchronized (history) { BlockChange last = history.peekLast(); if (last == null || last.tick() < minTick) return null; history.pollLast(); BLOCK_UNDO_STACK.computeIfAbsent(playerUuid, id -> new ArrayDeque<>()).addLast(last); return last; } }
     public static BlockChange redoMatchingBlockChange(UUID playerUuid, long maxTick) { Deque<BlockChange> undo = BLOCK_UNDO_STACK.get(playerUuid); if (undo == null) return null; synchronized (undo) { BlockChange last = undo.peekLast(); if (last == null || last.tick() > maxTick) return null; undo.pollLast(); BLOCK_HISTORY.computeIfAbsent(playerUuid, id -> new ArrayDeque<>()).addLast(last); return last; } }
+
+    /** Records every server-side block change, including TNT, pistons, redstone and mob AI. */
+    public static void recordGlobalBlockChange(GlobalBlockChange change) {
+        synchronized (GLOBAL_BLOCK_HISTORY) {
+            GLOBAL_BLOCK_HISTORY.addLast(change);
+            int max = Math.max(4096, ChronosConfig.getBufferTicks() * 64);
+            while (GLOBAL_BLOCK_HISTORY.size() > max) GLOBAL_BLOCK_HISTORY.pollFirst();
+            GLOBAL_BLOCK_UNDO_STACK.clear();
+        }
+    }
+
+    public static GlobalBlockChange popGlobalBlockChange(long minTick) {
+        synchronized (GLOBAL_BLOCK_HISTORY) {
+            GlobalBlockChange last = GLOBAL_BLOCK_HISTORY.peekLast();
+            if (last == null || last.tick() < minTick) return null;
+            GLOBAL_BLOCK_HISTORY.pollLast();
+            GLOBAL_BLOCK_UNDO_STACK.addLast(last);
+            return last;
+        }
+    }
+
+    public static GlobalBlockChange redoGlobalBlockChange(long maxTick) {
+        synchronized (GLOBAL_BLOCK_UNDO_STACK) {
+            GlobalBlockChange last = GLOBAL_BLOCK_UNDO_STACK.peekLast();
+            if (last == null || last.tick() > maxTick) return null;
+            GLOBAL_BLOCK_UNDO_STACK.pollLast();
+            GLOBAL_BLOCK_HISTORY.addLast(last);
+            return last;
+        }
+    }
+
     public static void recordEntitySnapshot(LivingEntity entity) { synchronized (ENTITY_HISTORY) { ENTITY_HISTORY.addLast(new EntitySnapshot(currentTick, entity.getUuid(), entity.getX(), entity.getY(), entity.getZ(), entity.getYaw(), entity.getPitch(), entity.getHealth())); int maxSize = ChronosConfig.getBufferTicks() * 8; while (ENTITY_HISTORY.size() > maxSize) ENTITY_HISTORY.pollFirst(); } }
     public static List<EntitySnapshot> getEntitySnapshotsSince(long minTick) { synchronized (ENTITY_HISTORY) { List<EntitySnapshot> result = new ArrayList<>(); for (EntitySnapshot s : ENTITY_HISTORY) if (s.tick() >= minTick) result.add(s); return result; } }
     public static List<EntitySnapshot> getEntitySnapshotsNear(long targetTick, long minTick, long maxTick) { synchronized (ENTITY_HISTORY) { Map<UUID, EntitySnapshot> best = new java.util.HashMap<>(); Map<UUID, Long> bestDiff = new java.util.HashMap<>(); for (EntitySnapshot s : ENTITY_HISTORY) { if (s.tick() < minTick || s.tick() > maxTick) continue; long diff = Math.abs(s.tick() - targetTick); Long current = bestDiff.get(s.entityUuid()); if (current == null || diff < current) { bestDiff.put(s.entityUuid(), diff); best.put(s.entityUuid(), s); } } return new ArrayList<>(best.values()); } }
