@@ -1,6 +1,6 @@
 {
   "parent": "item/generated",
   "textures": {
-    "layer0": "chronos:item/dimension_portal"
+    "layer0": "chronos:icon"
   }
 }
