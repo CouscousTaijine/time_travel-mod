@@ -19,7 +19,7 @@ public abstract class WorldMixin {
     @Inject(method = "setBlockState(Lnet/minecraft/util/math/BlockPos;Lnet/minecraft/block/BlockState;I)Z", at = @At("HEAD"))
     private void chronos$captureOld(BlockPos pos, BlockState newState, int flags, CallbackInfoReturnable<Boolean> cir) {
         World self = (World) (Object) this;
-        if (self instanceof ServerWorld && !RewindManager.isRestoring()) {
+        if (self instanceof ServerWorld && !RewindManager.isRestoring() && !RewindManager.isRewinding()) {
             chronos$oldState.set(self.getBlockState(pos));
         }
     }
@@ -29,7 +29,7 @@ public abstract class WorldMixin {
         World self = (World) (Object) this;
         BlockState oldState = chronos$oldState.get();
         chronos$oldState.remove();
-        if (!(self instanceof ServerWorld serverWorld) || RewindManager.isRestoring() || !cir.getReturnValueZ() || oldState == null || oldState.equals(newState)) return;
+        if (!(self instanceof ServerWorld serverWorld) || RewindManager.isRestoring() || RewindManager.isRewinding() || !cir.getReturnValueZ() || oldState == null || oldState.equals(newState)) return;
         HistoryManager.recordGlobalBlockChange(
                 new com.negger.chronos.history.GlobalBlockChange(
                         HistoryManager.getCurrentTick(),
