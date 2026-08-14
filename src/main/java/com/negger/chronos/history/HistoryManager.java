@@ -5,6 +5,7 @@ import net.minecraft.entity.LivingEntity;
 import net.minecraft.nbt.NbtCompound;
 import net.minecraft.nbt.NbtList;
 import net.minecraft.server.network.ServerPlayerEntity;
+import net.minecraft.world.level.ServerWorldProperties;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -38,7 +39,7 @@ public class HistoryManager {
 
     private static TimeSnapshot snapshot(ServerPlayerEntity player) {
         var world = player.getServerWorld();
-        var properties = world.getLevelProperties();
+        ServerWorldProperties properties = (ServerWorldProperties) world.getLevelProperties();
         NbtList items = new NbtList();
         player.getInventory().writeNbt(items);
         NbtCompound inventory = new NbtCompound();
