@@ -7,7 +7,6 @@ import com.negger.chronos.history.GlobalBlockChange;
 import com.negger.chronos.history.HistoryManager;
 import com.negger.chronos.history.ItemDropRecord;
 import com.negger.chronos.history.TimeSnapshot;
-import com.negger.chronos.network.ChronosNetworking;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.EntityType;
 import net.minecraft.entity.ItemEntity;
@@ -184,7 +183,6 @@ public class RewindManager {
         if (backToPresent) {
             SESSIONS.remove(player.getUuid());
             HistoryManager.setPaused(player.getUuid(), false);
-            ChronosNetworking.sendRewindEnded(player);
             player.sendMessage(Text.literal("§bRetour au présent."), true);
         } else {
             session.mode = null;
@@ -197,9 +195,13 @@ public class RewindManager {
         try {
             // Le client reçoit sa position historique via un vrai téléport réseau...
             player.networkHandler.requestTeleport(snapshot.x(), snapshot.y(), snapshot.z(), snapshot.yaw(), snapshot.pitch());
-            // ...et un paquet dédié pour interpoler visuellement entre les deux derniers
-            // points au lieu d'un saut sec à chaque tick (voir ChronosNetworking/ChronosClient).
-            ChronosNetworking.sendRewindMotion(player, snapshot);
+            // NOTE : le paquet REWIND_MOTION (lissage visuel côté client) a été retiré
+            // d'ici. Le requestTeleport ci-dessus force déjà le client à "snapper" sans
+            // interpolation à CHAQUE tick de rewind ; envoyer en plus un paquet censé
+            // interpoler entre deux points revenait à faire s'affronter les deux
+            // mécanismes à chaque tick, ce qui causait un tremblement visuel bien pire
+            // qu'avant. Pour un vrai lissage, il faudrait arrêter de forcer un téléport
+            // dur à chaque pas -- c'est un chantier à part, pas un simple ajout.
             player.setVelocity(0.0, 0.0, 0.0);
             player.fallDistance = 0.0f;
 
