@@ -25,6 +25,8 @@ public class HistoryManager {
     private static final Map<UUID, Deque<BlockChange>> BLOCK_UNDO_STACK = new ConcurrentHashMap<>();
     private static final Deque<GlobalBlockChange> GLOBAL_BLOCK_HISTORY = new ArrayDeque<>();
     private static final Deque<GlobalBlockChange> GLOBAL_BLOCK_UNDO_STACK = new ArrayDeque<>();
+    private static final Deque<ItemDropRecord> ITEM_DROP_HISTORY = new ArrayDeque<>();
+    private static final Deque<ItemDropRecord> ITEM_DROP_UNDO_STACK = new ArrayDeque<>();
     private static final Deque<EntitySnapshot> ENTITY_HISTORY = new ArrayDeque<>();
     private static final Deque<DeathRecord> DEATH_RECORDS = new ArrayDeque<>();
     private static long currentTick = 0;
@@ -79,7 +81,6 @@ public class HistoryManager {
             GLOBAL_BLOCK_UNDO_STACK.clear();
         }
     }
-
     public static GlobalBlockChange popGlobalBlockChange(long minTick) {
         synchronized (GLOBAL_BLOCK_HISTORY) {
             GlobalBlockChange last = GLOBAL_BLOCK_HISTORY.peekLast();
@@ -89,7 +90,6 @@ public class HistoryManager {
             return last;
         }
     }
-
     public static GlobalBlockChange redoGlobalBlockChange(long maxTick) {
         synchronized (GLOBAL_BLOCK_UNDO_STACK) {
             GlobalBlockChange last = GLOBAL_BLOCK_UNDO_STACK.peekLast();
@@ -98,6 +98,41 @@ public class HistoryManager {
             GLOBAL_BLOCK_HISTORY.addLast(last);
             return last;
         }
+    }
+
+    public static void recordItemDrop(ItemDropRecord record) {
+        synchronized (ITEM_DROP_HISTORY) {
+            ITEM_DROP_HISTORY.addLast(record);
+            int max = Math.max(2048, ChronosConfig.getBufferTicks() * 16);
+            while (ITEM_DROP_HISTORY.size() > max) ITEM_DROP_HISTORY.pollFirst();
+            ITEM_DROP_UNDO_STACK.clear();
+        }
+    }
+    public static List<ItemDropRecord> popItemDropsBetween(long minTick, long maxTick) {
+        List<ItemDropRecord> result = new ArrayList<>();
+        synchronized (ITEM_DROP_HISTORY) {
+            while (!ITEM_DROP_HISTORY.isEmpty()) {
+                ItemDropRecord last = ITEM_DROP_HISTORY.peekLast();
+                if (last.tick() < minTick || last.tick() > maxTick) break;
+                ITEM_DROP_HISTORY.pollLast();
+                ITEM_DROP_UNDO_STACK.addLast(last);
+                result.add(last);
+            }
+        }
+        return result;
+    }
+    public static List<ItemDropRecord> redoItemDropsUpTo(long maxTick) {
+        List<ItemDropRecord> result = new ArrayList<>();
+        synchronized (ITEM_DROP_UNDO_STACK) {
+            while (!ITEM_DROP_UNDO_STACK.isEmpty()) {
+                ItemDropRecord last = ITEM_DROP_UNDO_STACK.peekLast();
+                if (last.tick() > maxTick) break;
+                ITEM_DROP_UNDO_STACK.pollLast();
+                ITEM_DROP_HISTORY.addLast(last);
+                result.add(last);
+            }
+        }
+        return result;
     }
 
     public static void recordEntitySnapshot(LivingEntity entity) { synchronized (ENTITY_HISTORY) { ENTITY_HISTORY.addLast(new EntitySnapshot(currentTick, entity.getUuid(), entity.getX(), entity.getY(), entity.getZ(), entity.getYaw(), entity.getPitch(), entity.getHealth())); int maxSize = ChronosConfig.getBufferTicks() * 8; while (ENTITY_HISTORY.size() > maxSize) ENTITY_HISTORY.pollFirst(); } }
