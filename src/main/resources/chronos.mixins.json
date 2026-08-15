@@ -3,7 +3,8 @@
   "package": "com.negger.chronos.mixin",
   "compatibilityLevel": "JAVA_17",
   "mixins": [
-    "WorldMixin"
+    "WorldMixin",
+    "PlayerEntityMixin"
   ],
   "injectors": {
     "defaultRequire": 1
