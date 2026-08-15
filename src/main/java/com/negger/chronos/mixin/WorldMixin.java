@@ -20,8 +20,11 @@ public abstract class WorldMixin {
     // écraser par l'appel imbriqué, et l'appel englobant relisait "null" au retour :
     // son changement n'était alors jamais enregistré dans l'historique. Une pile
     // (une par thread) restaure le bon comportement pour les appels imbriqués.
-    @Unique private final ThreadLocal<java.util.ArrayDeque<BlockState>> chronos$oldStateStack =
-            ThreadLocal.withInitial(java.util.ArrayDeque::new);
+    // LinkedList (pas ArrayDeque : celui-ci interdit les éléments null et lève une
+    // NullPointerException dès qu'on empile un "pas suivi" -> crash au premier
+    // setBlockState, donc dès qu'on pose/casse un bloc ou qu'on restaure un rewind).
+    @Unique private final ThreadLocal<java.util.LinkedList<BlockState>> chronos$oldStateStack =
+            ThreadLocal.withInitial(java.util.LinkedList::new);
 
     @Inject(method = "setBlockState(Lnet/minecraft/util/math/BlockPos;Lnet/minecraft/block/BlockState;I)Z", at = @At("HEAD"))
     private void chronos$captureOld(BlockPos pos, BlockState newState, int flags, CallbackInfoReturnable<Boolean> cir) {
@@ -35,7 +38,7 @@ public abstract class WorldMixin {
 
     @Inject(method = "setBlockState(Lnet/minecraft/util/math/BlockPos;Lnet/minecraft/block/BlockState;I)Z", at = @At("RETURN"))
     private void chronos$recordChange(BlockPos pos, BlockState newState, int flags, CallbackInfoReturnable<Boolean> cir) {
-        java.util.ArrayDeque<BlockState> stack = chronos$oldStateStack.get();
+        java.util.LinkedList<BlockState> stack = chronos$oldStateStack.get();
         BlockState oldState = stack.isEmpty() ? null : stack.pop();
         World self = (World) (Object) this;
         if (!(self instanceof ServerWorld serverWorld) || oldState == null || RewindManager.isRestoring() || RewindManager.isRewinding() || !cir.getReturnValueZ() || oldState.equals(newState)) return;
