@@ -5,12 +5,12 @@ import com.negger.chronos.history.DeathRecord;
 import com.negger.chronos.history.EntitySnapshot;
 import com.negger.chronos.history.GlobalBlockChange;
 import com.negger.chronos.history.HistoryManager;
+import com.negger.chronos.history.ItemDropRecord;
 import com.negger.chronos.history.TimeSnapshot;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.EntityType;
+import net.minecraft.entity.ItemEntity;
 import net.minecraft.entity.LivingEntity;
-import net.minecraft.entity.player.PlayerInventory;
-import net.minecraft.item.ItemStack;
 import net.minecraft.nbt.NbtCompound;
 import net.minecraft.nbt.NbtList;
 import net.minecraft.particle.ParticleTypes;
@@ -161,10 +161,10 @@ public class RewindManager {
 
         long oldTick = session.buffer.get(session.cursor).tick();
         long newTick = session.buffer.get(newCursor).tick();
-        if (backward) revertBlocksAndEntities(player, newTick, oldTick); else replayBlocks(player, newTick);
+        if (backward) revertBlocksAndEntities(player, newTick, oldTick); else replayBlocksAndItems(player, newTick);
         restoreEntityPositions(newTick);
         session.cursor = newCursor;
-        applySnapshot(player, session.buffer.get(newCursor));
+        applySnapshot(player, session.buffer.get(newCursor), instant);
         if (!instant) playFeedback(player, backward);
 
         boolean reachedTarget = session.mode == Mode.AUTO_TO_TARGET && session.cursor == session.targetCursor;
@@ -181,10 +181,17 @@ public class RewindManager {
         else { session.mode = null; player.sendMessage(Text.literal("§dPoint de sauvegarde atteint."), true); }
     }
 
-    private static void applySnapshot(ServerPlayerEntity player, TimeSnapshot snapshot) {
+    private static void applySnapshot(ServerPlayerEntity player, TimeSnapshot snapshot, boolean instant) {
         RESTORING = true;
         try {
-            player.teleport(player.getServerWorld(), snapshot.x(), snapshot.y(), snapshot.z(), snapshot.yaw(), snapshot.pitch());
+            // Correctness first: the client must actually receive the historical position.
+            // requestTeleport is intentionally used for rewind steps until a client-side
+            // interpolation channel is available; refreshPositionAndAngles alone leaves
+            // the player's own client visually stuck at the present position.
+            player.networkHandler.requestTeleport(snapshot.x(), snapshot.y(), snapshot.z(), snapshot.yaw(), snapshot.pitch());
+            player.setVelocity(0.0, 0.0, 0.0);
+            player.fallDistance = 0.0f;
+
             ServerWorld world = player.getServerWorld();
             world.setTimeOfDay(snapshot.worldTime());
             var properties = (net.minecraft.world.level.ServerWorldProperties) world.getLevelProperties();
@@ -216,7 +223,13 @@ public class RewindManager {
         List<EntitySnapshot> snaps = HistoryManager.getEntitySnapshotsNear(targetTick, targetTick - ENTITY_MATCH_WINDOW, targetTick + ENTITY_MATCH_WINDOW);
         for (EntitySnapshot snap : snaps) for (var world : CURRENT_SERVER.getWorlds()) {
             Entity entity = world.getEntity(snap.entityUuid());
-            if (entity instanceof LivingEntity living) { living.refreshPositionAndAngles(snap.x(), snap.y(), snap.z(), snap.yaw(), snap.pitch()); living.setHealth(Math.max(0.1f, Math.min(living.getMaxHealth(), snap.health()))); break; }
+            if (entity instanceof LivingEntity living) {
+                living.refreshPositionAndAngles(snap.x(), snap.y(), snap.z(), snap.yaw(), snap.pitch());
+                living.setVelocity(0.0, 0.0, 0.0);
+                living.fallDistance = 0.0f;
+                living.setHealth(Math.max(0.1f, Math.min(living.getMaxHealth(), snap.health())));
+                break;
+            }
         }
     }
 
@@ -242,15 +255,35 @@ public class RewindManager {
         finally { RESTORING = false; }
     }
 
+    private static void removeDroppedItem(ItemDropRecord record) {
+        if (CURRENT_SERVER == null) return;
+        ServerWorld world = CURRENT_SERVER.getWorld(record.worldKey());
+        if (world == null) return;
+        Entity entity = world.getEntity(record.entityUuid());
+        if (entity instanceof ItemEntity item) item.discard();
+    }
+
+    private static void respawnDroppedItem(ItemDropRecord record) {
+        if (CURRENT_SERVER == null) return;
+        ServerWorld world = CURRENT_SERVER.getWorld(record.worldKey());
+        if (world == null || world.getEntity(record.entityUuid()) != null) return;
+        ItemEntity item = new ItemEntity(world, record.position().x, record.position().y, record.position().z, record.stack().copy());
+        item.setUuid(record.entityUuid());
+        item.setPickupDelay(10);
+        world.spawnEntity(item);
+    }
+
     private static void revertBlocksAndEntities(ServerPlayerEntity player, long newTick, long oldTick) {
         GlobalBlockChange change;
         while ((change = HistoryManager.popGlobalBlockChange(newTick + 1)) != null) setBlockFromHistory(change, true);
+        for (ItemDropRecord drop : HistoryManager.popItemDropsBetween(newTick + 1, oldTick)) removeDroppedItem(drop);
         for (DeathRecord death : HistoryManager.popDeathsBetween(newTick + 1, oldTick)) reviveEntity(player, death);
     }
 
-    private static void replayBlocks(ServerPlayerEntity player, long newTick) {
+    private static void replayBlocksAndItems(ServerPlayerEntity player, long newTick) {
         GlobalBlockChange change;
         while ((change = HistoryManager.redoGlobalBlockChange(newTick)) != null) setBlockFromHistory(change, false);
+        for (ItemDropRecord drop : HistoryManager.redoItemDropsUpTo(newTick)) respawnDroppedItem(drop);
     }
 
     private static void playFeedback(ServerPlayerEntity player, boolean backward) {
@@ -266,6 +299,7 @@ public class RewindManager {
         int count = 0;
         GlobalBlockChange change;
         while ((change = HistoryManager.popGlobalBlockChange(targetTick + 1)) != null) { setBlockFromHistory(change, true); count++; }
+        for (ItemDropRecord drop : HistoryManager.popItemDropsBetween(targetTick + 1, HistoryManager.getCurrentTick())) removeDroppedItem(drop);
         for (DeathRecord death : HistoryManager.popDeathsBetween(targetTick + 1, HistoryManager.getCurrentTick())) reviveEntity(player, death);
         return count;
     }
