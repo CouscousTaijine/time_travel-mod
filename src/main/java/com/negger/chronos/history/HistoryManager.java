@@ -65,7 +65,14 @@ public class HistoryManager {
     public static List<TimeSnapshot> combinedHistory(UUID playerUuid) { List<TimeSnapshot> shortTerm = snapshotHistory(playerUuid); List<TimeSnapshot> longTerm = getLongTermHistory(playerUuid); if (shortTerm.isEmpty()) return longTerm; long cutoff = shortTerm.get(0).tick(); List<TimeSnapshot> combined = new ArrayList<>(); for (TimeSnapshot s : longTerm) if (s.tick() < cutoff) combined.add(s); combined.addAll(shortTerm); return combined; }
     public static int getPlayerHistorySize(UUID playerUuid) { Deque<TimeSnapshot> history = PLAYER_HISTORY.get(playerUuid); return history == null ? 0 : history.size(); }
     public static void truncateHistoryTo(UUID playerUuid, int keepFromStart) { Deque<TimeSnapshot> history = PLAYER_HISTORY.get(playerUuid); if (history == null) return; List<TimeSnapshot> asList = new ArrayList<>(history); history.clear(); for (int i = 0; i < Math.min(keepFromStart, asList.size()); i++) history.addLast(asList.get(i)); }
-    public static void clearPlayerHistory(UUID playerUuid) { PLAYER_HISTORY.remove(playerUuid); BLOCK_HISTORY.remove(playerUuid); BLOCK_UNDO_STACK.remove(playerUuid); PAUSED_PLAYERS.remove(playerUuid); }
+    public static void clearPlayerHistory(UUID playerUuid) {
+        PLAYER_HISTORY.remove(playerUuid);
+        BLOCK_HISTORY.remove(playerUuid);
+        BLOCK_UNDO_STACK.remove(playerUuid);
+        PAUSED_PLAYERS.remove(playerUuid);
+        synchronized (ITEM_DROP_HISTORY) { ITEM_DROP_HISTORY.removeIf(drop -> drop.playerUuid().equals(playerUuid)); }
+        synchronized (ITEM_DROP_UNDO_STACK) { ITEM_DROP_UNDO_STACK.removeIf(drop -> drop.playerUuid().equals(playerUuid)); }
+    }
     public static void unloadLongTermFromMemory(UUID playerUuid) { LONG_TERM_HISTORY.remove(playerUuid); }
 
     public static void recordBlockChange(BlockChange change) { Deque<BlockChange> history = BLOCK_HISTORY.computeIfAbsent(change.playerUuid(), id -> new ArrayDeque<>()); synchronized (history) { history.addLast(change); int maxSize = ChronosConfig.getBufferTicks(); while (history.size() > maxSize) history.pollFirst(); } Deque<BlockChange> undo = BLOCK_UNDO_STACK.get(change.playerUuid()); if (undo != null) undo.clear(); }
